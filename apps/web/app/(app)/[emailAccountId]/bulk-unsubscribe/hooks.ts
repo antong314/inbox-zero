@@ -950,8 +950,10 @@ export function useBulkDelete<T extends Row>({
     },
   );
 
-  const onBulkDelete = (items: T[]) => {
-    posthog.capture("Clicked Bulk Delete");
+  const onBulkDelete = (items: T[], trackClick = true) => {
+    if (trackClick) {
+      posthog.capture("Clicked Bulk Delete");
+    }
 
     const promise = executeBulkTrash({ froms: items.map((item) => item.name) });
 

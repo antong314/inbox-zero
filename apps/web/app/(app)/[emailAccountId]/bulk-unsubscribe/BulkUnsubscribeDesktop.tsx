@@ -78,7 +78,7 @@ export function BulkUnsubscribeDesktop({
               Read
             </HeaderButton>
           </TableHead>
-          <TableHead className="w-[196px]" />
+          <TableHead className="w-[280px]" />
         </TableRow>
       </TableHeader>
       <TableBody>{tableRows}</TableBody>
@@ -168,7 +168,7 @@ export function BulkUnsubscribeRowDesktop({
           </span>
         </div>
       </TableCell>
-      <TableCell className="w-auto sm:w-[196px] p-1" data-cell="actions">
+      <TableCell className="w-auto sm:w-[280px] p-1" data-cell="actions">
         <div className="flex justify-end items-center gap-2">
           <ActionCell
             item={item}

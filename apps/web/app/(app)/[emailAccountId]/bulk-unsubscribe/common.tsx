@@ -92,6 +92,18 @@ export function ActionCell<T extends Row>({
 
   return (
     <>
+      <ArchiveAllButton
+        item={item}
+        posthog={posthog}
+        emailAccountId={emailAccountId}
+        mutate={mutate}
+      />
+      <DeleteAllButton
+        item={item}
+        posthog={posthog}
+        emailAccountId={emailAccountId}
+        mutate={mutate}
+      />
       {isUnsubscribed ? (
         <Badge variant="red" className="gap-1">
           <MailXIcon className="size-3" />
@@ -132,6 +144,7 @@ export function ActionCell<T extends Row>({
         refetchPremium={refetchPremium}
         filter={filter}
         openPremiumModal={openPremiumModal}
+        includeBulkActionsInMenu={false}
       />
     </>
   );
@@ -164,9 +177,24 @@ function UnsubscribeButton<T extends Row>({
       emailAccountId,
     },
   );
+  const { onBulkDelete, isBulkDeleting } = useBulkDelete({
+    mutate,
+    posthog,
+    emailAccountId,
+  });
 
   const hasUnsubscribeLink = unsubscribeLink !== "#";
   const isUnsubscribed = item.status === NewsletterStatus.UNSUBSCRIBED;
+  const isProcessing = unsubscribeLoading || isBulkDeleting;
+
+  const handleUnsubscribe = async () => {
+    if (!hasUnsubscribeAccess) return;
+
+    await onUnsubscribe();
+    if (hasUnsubscribeLink) {
+      onBulkDelete([item], false);
+    }
+  };
 
   const buttonText = isUnsubscribed
     ? "Resubscribe"
@@ -185,7 +213,7 @@ function UnsubscribeButton<T extends Row>({
         className="w-[110px] justify-center"
         onClick={() => setResubscribeDialogOpen(true)}
       >
-        {unsubscribeLoading && <ButtonLoader />}
+        {isProcessing && <ButtonLoader />}
         Resubscribe
       </Button>
     ) : (
@@ -198,10 +226,10 @@ function UnsubscribeButton<T extends Row>({
         <Link
           href={unsubscribeLink}
           target={hasUnsubscribeLink ? "_blank" : undefined}
-          onClick={onUnsubscribe}
+          onClick={handleUnsubscribe}
           rel="noopener noreferrer"
         >
-          {unsubscribeLoading && <ButtonLoader />}
+          {isProcessing && <ButtonLoader />}
           {buttonText}
         </Link>
       </Button>
@@ -220,6 +248,78 @@ function UnsubscribeButton<T extends Row>({
         mutate={mutate}
       />
     </>
+  );
+}
+
+function ArchiveAllButton<T extends Row>({
+  item,
+  posthog,
+  emailAccountId,
+  mutate,
+}: {
+  item: T;
+  posthog: PostHog;
+  emailAccountId: string;
+  mutate: () => Promise<void>;
+}) {
+  const { onBulkArchive, isBulkArchiving } = useBulkArchive({
+    posthog,
+    emailAccountId,
+    mutate,
+  });
+
+  return (
+    <Tooltip content="Archive all">
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => onBulkArchive([item])}
+        disabled={isBulkArchiving}
+      >
+        {isBulkArchiving ? (
+          <ButtonLoader />
+        ) : (
+          <ArchiveIcon className="size-5 text-gray-400" />
+        )}
+        <span className="sr-only">Archive all</span>
+      </Button>
+    </Tooltip>
+  );
+}
+
+function DeleteAllButton<T extends Row>({
+  item,
+  posthog,
+  emailAccountId,
+  mutate,
+}: {
+  item: T;
+  posthog: PostHog;
+  emailAccountId: string;
+  mutate: () => Promise<void>;
+}) {
+  const { onBulkDelete, isBulkDeleting } = useBulkDelete({
+    mutate,
+    posthog,
+    emailAccountId,
+  });
+
+  return (
+    <Tooltip content="Delete all">
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => onBulkDelete([item])}
+        disabled={isBulkDeleting}
+      >
+        {isBulkDeleting ? (
+          <ButtonLoader />
+        ) : (
+          <TrashIcon className="size-5 text-gray-400" />
+        )}
+        <span className="sr-only">Delete all</span>
+      </Button>
+    </Tooltip>
   );
 }
 
@@ -280,6 +380,7 @@ export function MoreDropdown<T extends Row>({
   refetchPremium,
   filter,
   openPremiumModal,
+  includeBulkActionsInMenu = true,
 }: {
   onOpenNewsletter?: (row: T) => void;
   item: T;
@@ -292,6 +393,7 @@ export function MoreDropdown<T extends Row>({
   refetchPremium?: () => Promise<UserResponse | null | undefined>;
   filter?: NewsletterFilterType;
   openPremiumModal?: () => void;
+  includeBulkActionsInMenu?: boolean;
 }) {
   const { provider } = useAccount();
   const terminology = getEmailTerminology(provider);
@@ -413,49 +515,47 @@ export function MoreDropdown<T extends Row>({
             </DropdownMenuSub>
           )}
 
-          <DropdownMenuSeparator />
+          {(showAutoArchive || includeBulkActionsInMenu) && (
+            <>
+              <DropdownMenuSeparator />
 
-          {/* Bulk actions section */}
-          {showAutoArchive && (
-            <DropdownMenuItem
-              onClick={() => {
-                if (!hasUnsubscribeAccess) {
-                  openPremiumModal?.();
-                  return;
-                }
+              {showAutoArchive && (
+                <DropdownMenuItem
+                  onClick={() => {
+                    if (!hasUnsubscribeAccess) {
+                      openPremiumModal?.();
+                      return;
+                    }
 
-                onBulkAutoArchive([item]);
-              }}
-            >
-              <ArchiveRestoreIcon className="mr-2 size-4" />
-              <span>Auto archive</span>
-            </DropdownMenuItem>
+                    onBulkAutoArchive([item]);
+                  }}
+                >
+                  <ArchiveRestoreIcon className="mr-2 size-4" />
+                  <span>Auto archive</span>
+                </DropdownMenuItem>
+              )}
+              {includeBulkActionsInMenu && (
+                <>
+                  <DropdownMenuItem onClick={() => onBulkArchive([item])}>
+                    {isBulkArchiving ? (
+                      <ButtonLoader />
+                    ) : (
+                      <ArchiveIcon className="mr-2 size-4" />
+                    )}
+                    <span>Archive all</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onBulkDelete([item])}>
+                    {isBulkDeleting ? (
+                      <ButtonLoader />
+                    ) : (
+                      <TrashIcon className="mr-2 size-4" />
+                    )}
+                    <span>Delete all</span>
+                  </DropdownMenuItem>
+                </>
+              )}
+            </>
           )}
-          <DropdownMenuItem onClick={() => onBulkArchive([item])}>
-            {isBulkArchiving ? (
-              <ButtonLoader />
-            ) : (
-              <ArchiveIcon className="mr-2 size-4" />
-            )}
-            <span>Archive all</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onClick={() => {
-              const yes = confirm(
-                `Are you sure you want to delete all emails from ${item.name}?`,
-              );
-              if (!yes) return;
-
-              onBulkDelete([item]);
-            }}
-          >
-            {isBulkDeleting ? (
-              <ButtonLoader />
-            ) : (
-              <TrashIcon className="mr-2 size-4" />
-            )}
-            <span>Delete all</span>
-          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
 
