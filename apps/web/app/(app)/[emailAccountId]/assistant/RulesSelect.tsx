@@ -18,7 +18,11 @@ export function RulesSelect() {
     "ruleId",
     parseAsString.withDefault("all"),
   );
+  const [, setPage] = useQueryState("page");
   const sortedRules = data ? sortRulesForAutomation(data) : undefined;
+  const selectRule = async (nextRuleId: string) => {
+    await Promise.all([setRuleId(nextRuleId), setPage("1")]);
+  };
 
   const getCurrentLabel = () => {
     if (ruleId === "all") return "All rules";
@@ -47,14 +51,14 @@ export function RulesSelect() {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={() => setRuleId("all")}>
+          <DropdownMenuItem onClick={() => selectRule("all")}>
             All rules
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => setRuleId("skipped")}>
+          <DropdownMenuItem onClick={() => selectRule("skipped")}>
             No match
           </DropdownMenuItem>
           {sortedRules?.map((rule) => (
-            <DropdownMenuItem key={rule.id} onClick={() => setRuleId(rule.id)}>
+            <DropdownMenuItem key={rule.id} onClick={() => selectRule(rule.id)}>
               {rule.name}
               {!rule.enabled && (
                 <span className="ml-1 text-muted-foreground">(disabled)</span>

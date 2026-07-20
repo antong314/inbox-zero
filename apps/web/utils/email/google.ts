@@ -977,6 +977,17 @@ export class GmailProvider implements EmailProvider {
     await removeThreadLabel(this.client, threadId, labelId);
   }
 
+  async removeMessageLabels(
+    messageId: string,
+    labelIds: string[],
+  ): Promise<void> {
+    await labelMessage({
+      gmail: this.client,
+      messageId,
+      removeLabelIds: labelIds,
+    });
+  }
+
   async removeThreadLabels(
     threadId: string,
     labelIds: string[],

@@ -232,6 +232,7 @@ export interface EmailProvider {
     folderName: string,
   ): Promise<void>;
   readonly name: "google" | "microsoft";
+  removeMessageLabels?(messageId: string, labelIds: string[]): Promise<void>;
   removeThreadLabel(threadId: string, labelId: string): Promise<void>;
   removeThreadLabels(threadId: string, labelIds: string[]): Promise<void>;
   replyToEmail(

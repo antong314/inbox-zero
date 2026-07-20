@@ -1,59 +1,109 @@
 "use client";
 
-import { Fragment, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useAction } from "next-safe-action/hooks";
 import { useQueryState, parseAsInteger, parseAsString } from "nuqs";
-import { format, isToday, isYesterday } from "date-fns";
+import { ChevronDown, Tags } from "lucide-react";
 import { LoadingContent } from "@/components/LoadingContent";
 import type { GetExecutedRulesResponse } from "@/app/api/user/executed-rules/history/route";
+import type { RulesResponse } from "@/app/api/user/rules/route";
 import { AlertBasic } from "@/components/Alert";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import { TablePagination } from "@/components/TablePagination";
-import { Badge } from "@/components/Badge";
 import { RulesSelect } from "@/app/(app)/[emailAccountId]/assistant/RulesSelect";
 import { useAccount } from "@/providers/EmailAccountProvider";
-import { useChat } from "@/providers/ChatProvider";
 import { useExecutedRules } from "@/hooks/useExecutedRules";
-import { useMessagesBatch } from "@/hooks/useMessagesBatch";
-import type { ParsedMessage } from "@/utils/types";
-import { EmailMessageCell } from "@/components/EmailMessageCell";
-import { FixWithChat } from "@/app/(app)/[emailAccountId]/assistant/FixWithChat";
 import { ResultsDisplay } from "@/app/(app)/[emailAccountId]/assistant/ResultDisplay";
-
-type ExecutedRuleResult = GetExecutedRulesResponse["results"][number];
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useRules } from "@/hooks/useRules";
+import { shouldLearnFromLabelRemoval } from "@/utils/rule/consts";
+import { sortRulesForAutomation } from "@/utils/rule/sort";
+import { reclassifyMessagesAction } from "@/utils/actions/reclassify";
+import { toastError, toastInfo, toastSuccess } from "@/components/Toast";
+import { getActionErrorMessage } from "@/utils/error";
+import { isGoogleProvider } from "@/utils/email/provider-types";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { extractNameFromEmail } from "@/utils/email";
 
 export function History() {
-  const [page] = useQueryState("page", parseAsInteger.withDefault(1));
+  const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(1));
   const [ruleId] = useQueryState("ruleId", parseAsString.withDefault("all"));
+  const [pageSize, setPageSize] = useQueryState(
+    "pageSize",
+    parseAsString.withDefault("100"),
+  );
 
-  const { data, isLoading, error } = useExecutedRules({ page, ruleId });
+  const { data, isLoading, error, mutate } = useExecutedRules({
+    page: Math.max(page, 1),
+    pageSize,
+    ruleId,
+  });
   const results = data?.results ?? [];
   const totalPages = data?.totalPages ?? 1;
-  const messageIds = useMemo(
-    () => results.map((result) => result.messageId),
-    [results],
-  );
-  const { data: messagesData, isLoading: isMessagesLoading } = useMessagesBatch(
-    {
-      ids: messageIds,
-    },
-  );
-  const messages = messagesData?.messages ?? [];
-  const messagesById = useMemo(() => mapMessagesById(messages), [messages]);
+
+  useEffect(() => {
+    if (page < 1) {
+      setPage(1);
+    } else if (
+      data &&
+      data.totalCount > 0 &&
+      results.length === 0 &&
+      page > 1
+    ) {
+      setPage(1);
+    }
+  }, [data, page, results.length, setPage]);
 
   return (
     <>
-      <RulesSelect />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <RulesSelect />
+        <div className="flex items-center gap-3">
+          {data && (
+            <span className="text-sm text-muted-foreground">
+              {data.totalCount.toLocaleString()} emails
+            </span>
+          )}
+          <Select
+            value={pageSize}
+            onValueChange={async (value) => {
+              await Promise.all([setPage(1), setPageSize(value)]);
+            }}
+          >
+            <SelectTrigger className="h-10 w-[150px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="100">Show 100</SelectItem>
+              <SelectItem value="500">Show 500</SelectItem>
+              <SelectItem value="all">Show all</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
       <Card className="mt-2">
         <LoadingContent loading={isLoading} error={error}>
           {results.length ? (
             <HistoryTable
               data={results}
               totalPages={totalPages}
-              messagesById={messagesById}
-              messagesLoading={isMessagesLoading}
+              refresh={async () => {
+                await mutate();
+              }}
             />
           ) : (
             <AlertBasic
@@ -74,64 +124,193 @@ export function History() {
 function HistoryTable({
   data,
   totalPages,
-  messagesById,
-  messagesLoading,
+  refresh,
 }: {
   data: GetExecutedRulesResponse["results"];
   totalPages: number;
-  messagesById: Record<string, ParsedMessage>;
-  messagesLoading: boolean;
+  refresh: () => Promise<void>;
 }) {
-  const { userEmail } = useAccount();
-  const { setInput } = useChat();
-  const groups = useMemo(() => groupByDate(data), [data]);
+  const { emailAccountId, provider } = useAccount();
+  const { data: rules } = useRules();
+  const [selectedMessages, setSelectedMessages] = useState<
+    Map<string, { messageId: string }>
+  >(new Map());
+  const isBulkReclassification = useRef(false);
+  const classificationRules = useMemo(
+    () =>
+      sortRulesForAutomation(
+        (isGoogleProvider(provider) ? (rules ?? []) : []).filter(
+          (rule) =>
+            rule.enabled &&
+            rule.systemType &&
+            shouldLearnFromLabelRemoval(rule.systemType) &&
+            rule.actions.some((action) => action.type === "LABEL"),
+        ),
+      ),
+    [provider, rules],
+  );
+  const selectableData = data.slice(0, 100);
+  const selectedPageCount = selectableData.filter((item) =>
+    selectedMessages.has(item.messageId),
+  ).length;
+  const canReclassify = classificationRules.length > 0;
+  const allPageSelected =
+    selectableData.length > 0 && selectedPageCount === selectableData.length;
+  const { execute: reclassify, isExecuting } = useAction(
+    reclassifyMessagesAction.bind(null, emailAccountId),
+    {
+      onSuccess: async ({ data: result }) => {
+        if (!result) return;
+        const retryMessageIds = new Set([
+          ...result.failedMessageIds,
+          ...result.failedLearningMessageIds,
+        ]);
+        if (isBulkReclassification.current) {
+          setSelectedMessages(
+            new Map(
+              [...retryMessageIds].map((messageId) => [
+                messageId,
+                { messageId },
+              ]),
+            ),
+          );
+        }
+        await refresh();
+        if (retryMessageIds.size > 0) {
+          toastInfo({
+            title: "Some corrections need another try",
+            description: isBulkReclassification.current
+              ? `${result.reclassifiedCount} email${result.reclassifiedCount === 1 ? "" : "s"} updated. ${retryMessageIds.size} remain selected so you can retry them.`
+              : "This email could not be fully reclassified. Please try again.",
+          });
+        } else {
+          toastSuccess({
+            description: `Reclassified ${result.reclassifiedCount} email${result.reclassifiedCount === 1 ? "" : "s"} from ${result.senderCount} sender${result.senderCount === 1 ? "" : "s"}. Future emails from these senders will use the selected classification.`,
+          });
+        }
+      },
+      onError: ({ error }) => {
+        toastError({ description: getActionErrorMessage(error) });
+      },
+    },
+  );
 
   return (
     <div>
+      {canReclassify && (
+        <div className="flex flex-wrap items-center gap-3 border-b p-3">
+          <label
+            htmlFor="select-history-page"
+            className="flex cursor-pointer items-center gap-2 text-sm"
+          >
+            <Checkbox
+              id="select-history-page"
+              checked={
+                allPageSelected
+                  ? true
+                  : selectedPageCount > 0
+                    ? "indeterminate"
+                    : false
+              }
+              onCheckedChange={(checked) => {
+                setSelectedMessages((current) => {
+                  const next = new Map(current);
+                  for (const item of selectableData) {
+                    if (checked === true) {
+                      if (next.size < 100) {
+                        next.set(item.messageId, {
+                          messageId: item.messageId,
+                        });
+                      }
+                    } else {
+                      next.delete(item.messageId);
+                    }
+                  }
+                  return next;
+                });
+              }}
+            />
+            {data.length > 100 ? "Select first 100" : "Select page"}
+          </label>
+          {selectedMessages.size > 0 && (
+            <>
+              <span className="text-sm font-medium">
+                {selectedMessages.size} selected
+              </span>
+              <ClassificationPicker
+                rules={classificationRules}
+                disabled={isExecuting}
+                label={isExecuting ? "Reclassifying..." : "Reclassify selected"}
+                onSelect={(targetRuleId) => {
+                  isBulkReclassification.current = true;
+                  reclassify({
+                    targetRuleId,
+                    messages: [...selectedMessages.values()],
+                  });
+                }}
+              />
+              <span className="text-xs text-muted-foreground">
+                Also remembers each sender for future emails
+              </span>
+            </>
+          )}
+        </div>
+      )}
       <Table>
         <TableBody>
-          {groups.map((group) => (
-            <Fragment key={group.key}>
-              <TableRow className="hover:bg-transparent">
-                <TableCell
-                  colSpan={2}
-                  className="bg-muted/40 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground"
-                >
-                  {formatDateGroupLabel(group.date)}
+          {data.map((executedRule) => (
+            <TableRow key={executedRule.messageId} className="h-10">
+              {canReclassify && (
+                <TableCell className="w-10 py-1 pr-0">
+                  <Checkbox
+                    aria-label={`Select email ${executedRule.messageId}`}
+                    checked={selectedMessages.has(executedRule.messageId)}
+                    onCheckedChange={(checked) => {
+                      setSelectedMessages((current) => {
+                        const next = new Map(current);
+                        if (checked === true && next.size < 100) {
+                          next.set(executedRule.messageId, {
+                            messageId: executedRule.messageId,
+                          });
+                        } else {
+                          next.delete(executedRule.messageId);
+                        }
+                        return next;
+                      });
+                    }}
+                  />
                 </TableCell>
-              </TableRow>
-              {group.items.map((er) => {
-                const message = messagesById[er.messageId];
-                const isMessageLoading = !message && messagesLoading;
-
-                return (
-                  <TableRow key={er.messageId}>
-                    <TableCell>
-                      <EmailCell
-                        message={message}
-                        messageId={er.messageId}
-                        threadId={er.threadId}
-                        userEmail={userEmail}
-                        isMessageLoading={isMessageLoading}
-                      />
-                      {!er.executedRules[0]?.automated && (
-                        <Badge color="yellow" className="mt-2">
-                          Applied manually
-                        </Badge>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <RuleCell
-                        executedRules={er.executedRules}
-                        message={message}
-                        setInput={setInput}
-                        isMessageLoading={isMessageLoading}
-                      />
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </Fragment>
+              )}
+              <TableCell className="min-w-0 py-1.5">
+                <div className="flex min-w-0 items-center gap-2 text-sm">
+                  <span
+                    className="max-w-56 shrink-0 truncate font-medium"
+                    title={executedRule.sender ?? undefined}
+                  >
+                    {executedRule.sender
+                      ? extractNameFromEmail(executedRule.sender)
+                      : "Unknown sender"}
+                  </span>
+                  <span className="min-w-0 truncate text-muted-foreground">
+                    {executedRule.subject || "No subject"}
+                  </span>
+                </div>
+              </TableCell>
+              <TableCell className="w-px py-1">
+                <RuleCell
+                  executedRules={executedRule.executedRules}
+                  classificationRules={classificationRules}
+                  reclassifying={isExecuting}
+                  onReclassify={(targetRuleId) => {
+                    isBulkReclassification.current = false;
+                    reclassify({
+                      targetRuleId,
+                      messages: [{ messageId: executedRule.messageId }],
+                    });
+                  }}
+                />
+              </TableCell>
+            </TableRow>
           ))}
         </TableBody>
       </Table>
@@ -141,114 +320,66 @@ function HistoryTable({
   );
 }
 
-function EmailCell({
-  message,
-  threadId,
-  messageId,
-  userEmail,
-  isMessageLoading,
-}: {
-  message?: ParsedMessage;
-  threadId: string;
-  messageId: string;
-  userEmail: string;
-  isMessageLoading: boolean;
-}) {
-  if (message) {
-    return (
-      <EmailMessageCell
-        sender={message.headers.from}
-        subject={message.headers.subject}
-        snippet={message.snippet}
-        userEmail={userEmail}
-        threadId={threadId}
-        messageId={messageId}
-        labelIds={message.labelIds}
-      />
-    );
-  }
-
-  if (isMessageLoading) {
-    return (
-      <div className="space-y-2">
-        <Skeleton className="h-5 w-48" />
-        <Skeleton className="h-4 w-72" />
-        <Skeleton className="h-4 w-80" />
-      </div>
-    );
-  }
-
-  return (
-    <span className="text-sm text-muted-foreground">Email unavailable</span>
-  );
-}
-
 function RuleCell({
   executedRules,
-  message,
-  setInput,
-  isMessageLoading,
+  classificationRules,
+  reclassifying,
+  onReclassify,
 }: {
   executedRules: GetExecutedRulesResponse["results"][number]["executedRules"];
-  message?: ParsedMessage;
-  setInput: (input: string) => void;
-  isMessageLoading: boolean;
+  classificationRules: RulesResponse;
+  reclassifying: boolean;
+  onReclassify: (targetRuleId: string) => void;
 }) {
   return (
-    <div className="flex items-center justify-end gap-2">
+    <div className="flex flex-wrap items-center justify-end gap-2">
       <div>
         <ResultsDisplay results={executedRules} />
       </div>
-      {message ? (
-        <FixWithChat
-          setInput={setInput}
-          message={message}
-          results={executedRules}
+      {classificationRules.length > 0 && (
+        <ClassificationPicker
+          rules={classificationRules}
+          disabled={reclassifying}
+          label="Reclassify"
+          onSelect={onReclassify}
         />
-      ) : isMessageLoading ? (
-        <Skeleton className="h-9 w-16" />
-      ) : (
-        <Button variant="outline" size="sm" disabled>
-          Fix
-        </Button>
       )}
     </div>
   );
 }
 
-function mapMessagesById(messages: ParsedMessage[]) {
-  return messages.reduce<Record<string, ParsedMessage>>((acc, message) => {
-    acc[message.id] = message;
-    return acc;
-  }, {});
-}
-
-function groupByDate(items: ExecutedRuleResult[]) {
-  const groups: {
-    key: string;
-    date: Date | null;
-    items: ExecutedRuleResult[];
-  }[] = [];
-  for (const item of items) {
-    const createdAt = item.executedRules[0]?.createdAt;
-    const date = createdAt ? new Date(createdAt) : null;
-    const key = date ? format(date, "yyyy-MM-dd") : "unknown";
-    const last = groups[groups.length - 1];
-    if (last?.key === key) {
-      last.items.push(item);
-    } else {
-      groups.push({ key, date, items: [item] });
-    }
-  }
-  return groups;
-}
-
-function formatDateGroupLabel(date: Date | null) {
-  if (!date) return "Unknown date";
-  if (isToday(date)) return "Today";
-  if (isYesterday(date)) return "Yesterday";
-  if (date.getFullYear() === new Date().getFullYear()) {
-    return format(date, "EEEE, MMM d");
-  }
-  return format(date, "EEEE, MMM d, yyyy");
+function ClassificationPicker({
+  rules,
+  disabled,
+  label,
+  onSelect,
+}: {
+  rules: RulesResponse;
+  disabled: boolean;
+  label: string;
+  onSelect: (targetRuleId: string) => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 px-2"
+          disabled={disabled}
+        >
+          <Tags className="mr-1.5 size-4" />
+          {label}
+          <ChevronDown className="ml-1.5 size-3.5 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {rules.map((rule) => (
+          <DropdownMenuItem key={rule.id} onClick={() => onSelect(rule.id)}>
+            {rule.name}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 }

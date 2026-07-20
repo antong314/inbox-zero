@@ -333,6 +333,26 @@ describe("GmailProvider.getLabels", () => {
   });
 });
 
+describe("GmailProvider.removeMessageLabels", () => {
+  it("removes labels only from the selected message", async () => {
+    const labelMessage = vi
+      .spyOn(gmailLabelModule, "labelMessage")
+      .mockResolvedValue(undefined);
+    const provider = new GmailProvider({} as any);
+
+    await provider.removeMessageLabels("message-1", [
+      "newsletter",
+      "marketing",
+    ]);
+
+    expect(labelMessage).toHaveBeenCalledWith({
+      gmail: expect.anything(),
+      messageId: "message-1",
+      removeLabelIds: ["newsletter", "marketing"],
+    });
+  });
+});
+
 function createThread(messages: ParsedMessage[]): EmailThread {
   return {
     id: "thread-1",

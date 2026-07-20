@@ -11,7 +11,10 @@ import {
 
 export function TablePagination({ totalPages }: { totalPages: number }) {
   const searchParams = useSearchParams();
-  const page = Number.parseInt(searchParams.get("page") || "1");
+  const page = Math.max(
+    1,
+    Number.parseInt(searchParams.get("page") || "1") || 1,
+  );
   const hrefForPage = useCallback(
     (value: number) => {
       const params = new URLSearchParams(searchParams);
@@ -25,8 +28,11 @@ export function TablePagination({ totalPages }: { totalPages: number }) {
   if (totalPages <= 1) return null;
 
   return (
-    <div className="m-4">
-      <Pagination className="justify-end">
+    <div className="m-4 flex items-center justify-between gap-4">
+      <span className="text-sm text-muted-foreground">
+        Page {page} of {totalPages}
+      </span>
+      <Pagination className="mx-0 w-auto justify-end">
         <PaginationContent>
           {page > 1 && (
             <PaginationItem>
