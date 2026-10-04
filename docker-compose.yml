@@ -149,7 +149,7 @@ services:
         (
           while true; do
             echo \"[cron] Scheduling meeting recorder bots...\"
-            curl -s -X GET 'http://web:3000/api/meeting-recorder/schedule' -H \"Authorization: Bearer $${CRON_SECRET}\" || echo \"[cron] Warning: meeting-recorder request failed\"
+            curl -s -X GET \"$${INTERNAL_API_URL:-http://web:3000}/api/meeting-recorder/schedule\" -H \"Authorization: Bearer $${CRON_SECRET}\" || echo \"[cron] Warning: meeting-recorder request failed\"
             sleep 300
           done
         ) &
