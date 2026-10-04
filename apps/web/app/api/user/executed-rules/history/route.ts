@@ -15,6 +15,8 @@ import {
   type HistoryPageSize,
 } from "@/utils/history-pagination";
 
+const CLIENT_DETAIL_LIMIT = 100;
+
 export type GetExecutedRulesResponse = Awaited<
   ReturnType<typeof getExecutedRules>
 >;
@@ -170,11 +172,18 @@ async function getExecutedRules({
       })
     : [];
 
-  const summaries = await fetchMessageSummaries({
-    messageIds: messages.map((message) => message.messageId),
-    emailProvider,
-    logger,
-  });
+  // The client loads full details for the first page of rows itself (the
+  // messages batch endpoint caps at 100), so only summarize rows beyond that.
+  // Thread expansions are always small enough for the client to handle.
+  const summaries = threadId
+    ? []
+    : await fetchMessageSummaries({
+        messageIds: messages
+          .slice(CLIENT_DETAIL_LIMIT)
+          .map((message) => message.messageId),
+        emailProvider,
+        logger,
+      });
   const summariesById = new Map(
     summaries.map((summary) => [summary.id, summary]),
   );
@@ -224,42 +233,17 @@ async function fetchMessageSummaries({
         try {
           return await emailProvider.getMessagesBatch(messageIdsBatch);
         } catch (error) {
+          // Don't fall back to per-message fetches: when Gmail is rate
+          // limiting, that multiplies the load and starves other requests.
           logger.warn("Failed to load a batch of history messages", {
             error,
             messageCount: messageIdsBatch.length,
           });
-          return fetchMessageSummariesIndividually({
-            messageIds: messageIdsBatch,
-            emailProvider,
-          });
+          return [];
         }
       }),
     ),
   );
 
   return results.flatMap((result) => result ?? []);
-}
-
-async function fetchMessageSummariesIndividually({
-  messageIds,
-  emailProvider,
-}: {
-  messageIds: string[];
-  emailProvider: EmailProvider;
-}) {
-  const queue = new PQueue({ concurrency: 4 });
-  const results = await Promise.all(
-    messageIds.map((messageId) =>
-      queue.add(async () => {
-        try {
-          const [message] = await emailProvider.getMessagesBatch([messageId]);
-          return message;
-        } catch {
-          return null;
-        }
-      }),
-    ),
-  );
-
-  return results.filter((message) => message != null);
 }
