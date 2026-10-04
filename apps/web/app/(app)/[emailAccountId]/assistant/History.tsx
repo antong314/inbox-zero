@@ -95,7 +95,7 @@ export function History() {
           </Select>
         </div>
       </div>
-      <Card className="mt-2">
+      <Card className="mt-2 min-w-0">
         <LoadingContent loading={isLoading} error={error}>
           {results.length ? (
             <HistoryTable
@@ -256,7 +256,7 @@ function HistoryTable({
           )}
         </div>
       )}
-      <Table>
+      <Table className="table-fixed">
         <TableBody>
           {data.map((executedRule) => (
             <TableRow key={executedRule.messageId} className="h-10">
@@ -281,7 +281,7 @@ function HistoryTable({
                   />
                 </TableCell>
               )}
-              <TableCell className="min-w-0 py-1.5">
+              <TableCell className="min-w-0 overflow-hidden py-1.5">
                 <div className="flex min-w-0 items-center gap-2 text-sm">
                   <span
                     className="max-w-56 shrink-0 truncate font-medium"
@@ -296,7 +296,7 @@ function HistoryTable({
                   </span>
                 </div>
               </TableCell>
-              <TableCell className="w-px py-1">
+              <TableCell className="w-44 overflow-hidden whitespace-nowrap py-1 pr-2 pl-0">
                 <RuleCell
                   executedRules={executedRule.executedRules}
                   classificationRules={classificationRules}
@@ -332,8 +332,8 @@ function RuleCell({
   onReclassify: (targetRuleId: string) => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center justify-end gap-2">
-      <div>
+    <div className="flex items-center justify-end gap-2 whitespace-nowrap">
+      <div className="shrink-0">
         <ResultsDisplay results={executedRules} />
       </div>
       {classificationRules.length > 0 && (
@@ -341,6 +341,7 @@ function RuleCell({
           rules={classificationRules}
           disabled={reclassifying}
           label="Reclassify"
+          compact
           onSelect={onReclassify}
         />
       )}
@@ -352,11 +353,13 @@ function ClassificationPicker({
   rules,
   disabled,
   label,
+  compact = false,
   onSelect,
 }: {
   rules: RulesResponse;
   disabled: boolean;
   label: string;
+  compact?: boolean;
   onSelect: (targetRuleId: string) => void;
 }) {
   return (
@@ -365,12 +368,18 @@ function ClassificationPicker({
         <Button
           variant="outline"
           size="sm"
-          className="h-7 px-2"
+          className="h-7 shrink-0 whitespace-nowrap px-2"
           disabled={disabled}
+          aria-label={label}
+          title={compact ? label : undefined}
         >
-          <Tags className="mr-1.5 size-4" />
-          {label}
-          <ChevronDown className="ml-1.5 size-3.5 text-muted-foreground" />
+          <Tags className={compact ? "size-4" : "mr-1.5 size-4"} />
+          <span className={compact ? "sr-only" : ""}>{label}</span>
+          <ChevronDown
+            className={
+              compact ? "hidden" : "ml-1.5 size-3.5 text-muted-foreground"
+            }
+          />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">

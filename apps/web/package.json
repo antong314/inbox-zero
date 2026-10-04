@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "cross-env NODE_OPTIONS=--max_old_space_size=6144 next dev --turbopack",
+    "dev": "cross-env NODE_OPTIONS=--max_old_space_size=1536 next dev --turbopack",
     "dev:e2e": "dotenv -e .env.e2e -- cross-env NODE_OPTIONS=--max_old_space_size=6144 next dev --turbopack",
     "build": "prisma migrate deploy && cross-env NODE_OPTIONS=--max_old_space_size=16384 next build && serwist build serwist.config.mjs",
     "build:ci": "cross-env NODE_OPTIONS=--max_old_space_size=16384 next build && serwist build serwist.config.mjs",
