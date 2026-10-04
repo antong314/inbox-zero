@@ -4,8 +4,9 @@ import prisma from "@/utils/__mocks__/prisma";
 import {
   getDefaultActions,
   getRuleConfig,
-  SYSTEM_RULE_ORDER,
+  isOptInSystemType,
 } from "@/utils/rule/consts";
+import { SYSTEM_RULE_ORDER } from "@/utils/rule/sort";
 import { vi } from "vitest";
 
 type AnyMock = ReturnType<typeof vi.fn>;
@@ -25,7 +26,9 @@ type RuleMutationMocks = {
 };
 
 export function buildDefaultSystemRuleRows(updatedAt: Date) {
-  return SYSTEM_RULE_ORDER.map((systemType) => {
+  return SYSTEM_RULE_ORDER.filter(
+    (systemType) => !isOptInSystemType(systemType),
+  ).map((systemType) => {
     const config = getRuleConfig(systemType);
 
     return {

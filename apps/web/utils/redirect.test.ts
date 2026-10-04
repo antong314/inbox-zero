@@ -125,4 +125,52 @@ describe("getSafeRedirectUrl", () => {
       }),
     ).toBe("/login");
   });
+
+  it("hands native MCP OAuth callbacks back to the client only when explicitly allowed", () => {
+    const cursorCallback =
+      "cursor://anysphere.cursor-mcp/oauth/callback?code=abc&state=xyz";
+
+    expect(getSafeRedirectUrl(cursorCallback, { allowExternal: true })).toBe(
+      "/",
+    );
+    expect(
+      getSafeRedirectUrl(cursorCallback, {
+        allowNativeOAuthRedirect: true,
+        fallbackUrl: "/login",
+      }),
+    ).toBe(cursorCallback);
+    expect(
+      getSafeRedirectUrl("http://127.0.0.1:8787/callback?code=abc", {
+        allowNativeOAuthRedirect: true,
+      }),
+    ).toBe("http://127.0.0.1:8787/callback?code=abc");
+    expect(
+      getSafeRedirectUrl("javascript:alert(1)", {
+        allowNativeOAuthRedirect: true,
+        fallbackUrl: "/login",
+      }),
+    ).toBe("/login");
+  });
+
+  it("opens the Inbox Zero app callback only when explicitly allowed", () => {
+    expect(
+      getSafeRedirectUrl(
+        "inboxzero://auth-callback?state=ADUZf5bSBOBSBzj58yThh17uiqgEg1PmsNzu-s4cMMA&code=xz5IkObSXqOpdCvBARrwRnqhOrxRQNX9qPeoT9G-jws",
+      ),
+    ).toBe("/");
+    expect(
+      getSafeRedirectUrl(
+        "inboxzero://auth-callback?state=ADUZf5bSBOBSBzj58yThh17uiqgEg1PmsNzu-s4cMMA&code=xz5IkObSXqOpdCvBARrwRnqhOrxRQNX9qPeoT9G-jws",
+        { allowAppCallback: true },
+      ),
+    ).toBe(
+      "inboxzero://auth-callback?state=ADUZf5bSBOBSBzj58yThh17uiqgEg1PmsNzu-s4cMMA&code=xz5IkObSXqOpdCvBARrwRnqhOrxRQNX9qPeoT9G-jws",
+    );
+    expect(
+      getSafeRedirectUrl("inboxzero://settings", {
+        allowAppCallback: true,
+        fallbackUrl: "/login",
+      }),
+    ).toBe("/login");
+  });
 });

@@ -3,6 +3,7 @@
 import { actionClient } from "@/utils/actions/safe-action";
 import {
   saveAiSettingsBody,
+  saveDecisionModelSettingsBody,
   saveSensitiveDataPolicyBody,
   saveEmailUpdateSettingsBody,
   saveDigestScheduleBody,
@@ -113,6 +114,22 @@ export const updateAiSettingsAction = actionClientUser
     },
   );
 
+export const updateDecisionModelSettingsAction = actionClientUser
+  .metadata({ name: "updateDecisionModelSettings" })
+  .inputSchema(saveDecisionModelSettingsBody)
+  .action(
+    async ({ ctx: { userId }, parsedInput: { decisionModelEnabled } }) => {
+      if (env.NEXT_PUBLIC_AI_MODEL_SETTINGS_DISABLED) {
+        throw new SafeError("AI model settings are managed by the deployment.");
+      }
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { decisionModelEnabled },
+      });
+    },
+  );
+
 export const updateSensitiveDataPolicyAction = actionClient
   .metadata({ name: "updateSensitiveDataPolicy" })
   .inputSchema(saveSensitiveDataPolicyBody)
@@ -157,13 +174,16 @@ export const updateDigestScheduleAction = actionClient
 
     const { emailAccountId: _emailAccountId, ...update } = create;
 
-    await prisma.schedule.upsert({
+    const schedule = await prisma.schedule.upsert({
       where: { emailAccountId },
       create,
       update,
     });
 
-    return { success: true };
+    return {
+      success: true,
+      nextOccurrenceAt: schedule.nextOccurrenceAt?.toISOString() ?? null,
+    };
   });
 
 export const updateDigestItemsAction = actionClient

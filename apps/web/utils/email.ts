@@ -199,21 +199,48 @@ export function getNewsletterSenderDisplayName({
   return fromName?.trim() || "";
 }
 
+/** Two letters at most: initials from a display name, or the address's first letters. */
+export function getInitials(name: string) {
+  // Spread by code point so an emoji or astral letter isn't split in half.
+  const words = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => [...word]);
+  if (words.length === 0) return "?";
+  if (words.length === 1) return words[0].slice(0, 2).join("").toUpperCase();
+  return `${words[0][0]}${words[words.length - 1][0]}`.toUpperCase();
+}
+
 // Public email providers where we should search by full email address
 // For company domains, we search by domain to catch emails from different people at same company
 export const PUBLIC_EMAIL_DOMAINS = new Set([
   "gmail.com",
+  "googlemail.com",
   "yahoo.com",
+  "ymail.com",
+  "rocketmail.com",
   "hotmail.com",
   "outlook.com",
+  "live.com",
+  "msn.com",
   "aol.com",
   "icloud.com",
   "me.com",
+  "mac.com",
+  "proton.me",
   "protonmail.com",
+  "protonmail.ch",
+  "pm.me",
   "zoho.com",
   "yandex.com",
+  "yandex.ru",
+  "ya.ru",
   "fastmail.com",
+  "fastmail.fm",
   "gmx.com",
+  "gmx.net",
+  "gmx.de",
   "hey.com",
   "mail.com",
 ]);
@@ -232,4 +259,15 @@ export function getSearchTermForSender(email: string): string {
   return isPublicEmailDomain(domain)
     ? extractEmailAddress(email) || email
     : domain;
+}
+
+// Sharing a public provider says nothing about affiliation, so those compare by address.
+export function isSameOrganization(left: string, right: string): boolean {
+  if (!left || !right) return false;
+  if (isSameEmailAddress(left, right)) return true;
+
+  const leftDomain = extractDomainFromEmail(left).toLowerCase();
+  if (!leftDomain || isPublicEmailDomain(leftDomain)) return false;
+
+  return leftDomain === extractDomainFromEmail(right).toLowerCase();
 }

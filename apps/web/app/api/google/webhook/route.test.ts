@@ -1,4 +1,14 @@
+import { publishLocalMailHint } from "@/utils/redis/local-mail-hints";
+import { markGmailHistoryCatchUp } from "@/utils/redis/gmail-history-catch-up";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/utils/redis/gmail-history-catch-up", () => ({
+  markGmailHistoryCatchUp: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@/utils/redis/local-mail-hints", () => ({
+  publishLocalMailHint: vi.fn().mockResolvedValue(undefined),
+}));
 
 const {
   envMock,
@@ -79,12 +89,13 @@ describe("Google webhook route", () => {
       token: "test-google-webhook-token",
     });
 
-    const response = await POST(request as any);
+    const response = await POST(request as any, {} as never);
     const body = await response.json();
 
     expect(response.status).toBe(503);
     expect(body).toEqual({ message: "Google webhook is not configured" });
     expect(processHistoryForUserMock).not.toHaveBeenCalled();
+    expect(publishLocalMailHint).not.toHaveBeenCalled();
   });
 
   it("rejects requests with an invalid verification token", async () => {
@@ -92,12 +103,13 @@ describe("Google webhook route", () => {
       token: "invalid-token",
     });
 
-    const response = await POST(request as any);
+    const response = await POST(request as any, {} as never);
     const body = await response.json();
 
     expect(response.status).toBe(403);
     expect(body).toEqual({ message: "Invalid verification token" });
     expect(processHistoryForUserMock).not.toHaveBeenCalled();
+    expect(publishLocalMailHint).not.toHaveBeenCalled();
   });
 
   it("allows requests without a token when verification is intentionally disabled", async () => {
@@ -107,13 +119,13 @@ describe("Google webhook route", () => {
       historyId: 123,
     });
 
-    const response = await POST(request as any);
+    const response = await POST(request as any, {} as never);
     const body = await response.json();
 
     expect(response.status).toBe(200);
     expect(body).toEqual({ ok: true });
     expect(processHistoryForUserMock).toHaveBeenCalledWith(
-      { emailAddress: "user@example.com", historyId: 123 },
+      { emailAddress: "user@example.com", historyId: "123" },
       { preloadedEmailAccount: null },
       expect.anything(),
     );
@@ -128,15 +140,40 @@ describe("Google webhook route", () => {
       historyId: 123,
     });
 
-    const response = await POST(request as any);
+    const response = await POST(request as any, {} as never);
     const body = await response.json();
 
     expect(response.status).toBe(200);
     expect(body).toEqual({ ok: true });
+    expect(publishLocalMailHint).toHaveBeenCalledWith(
+      "account-1",
+      expect.anything(),
+    );
     expect(runWithBackgroundLoggerFlushMock).toHaveBeenCalledTimes(1);
+    expect(markGmailHistoryCatchUp).not.toHaveBeenCalled();
     expect(processHistoryForUserMock).toHaveBeenCalledWith(
-      { emailAddress: "user@example.com", historyId: 123 },
+      { emailAddress: "user@example.com", historyId: "123" },
       { preloadedEmailAccount: { id: "account-1" } },
+      expect.anything(),
+    );
+  });
+
+  it("preserves large Gmail history IDs as opaque strings", async () => {
+    const request = createRequest({
+      token: "test-google-webhook-token",
+      emailAddress: "user@example.com",
+      historyId: "90071992547409931234",
+    });
+
+    const response = await POST(request as any, {} as never);
+
+    expect(response.status).toBe(200);
+    expect(processHistoryForUserMock).toHaveBeenCalledWith(
+      {
+        emailAddress: "user@example.com",
+        historyId: "90071992547409931234",
+      },
+      { preloadedEmailAccount: null },
       expect.anything(),
     );
   });
@@ -155,13 +192,21 @@ describe("Google webhook route", () => {
       historyId: 123,
     });
 
-    const response = await POST(request as any);
+    const response = await POST(request as any, {} as never);
     const body = await response.json();
 
     expect(response.status).toBe(200);
     expect(body).toEqual({ ok: true });
     expect(cleanupWebhookAccountOnRateLimitSkipMock).toHaveBeenCalledWith(
       { id: "account-1" },
+      expect.anything(),
+    );
+    expect(publishLocalMailHint).toHaveBeenCalledWith(
+      "account-1",
+      expect.anything(),
+    );
+    expect(markGmailHistoryCatchUp).toHaveBeenCalledWith(
+      "account-1",
       expect.anything(),
     );
     expect(runWithBackgroundLoggerFlushMock).not.toHaveBeenCalled();
@@ -176,7 +221,7 @@ function createRequest({
 }: {
   token?: string;
   emailAddress?: string;
-  historyId?: number;
+  historyId?: number | string;
 }) {
   const requestUrl = new URL("https://example.com/api/google/webhook");
   if (token) requestUrl.searchParams.set("token", token);

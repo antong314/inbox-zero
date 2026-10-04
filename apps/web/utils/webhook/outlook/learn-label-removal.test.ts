@@ -1,7 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import prisma from "@/utils/prisma";
-import { saveLearnedPattern } from "@/utils/rule/learned-patterns";
-import { GroupItemSource, SystemType } from "@/generated/prisma/enums";
+import {
+  removeAiLearnedPattern,
+  saveLearnedPattern,
+} from "@/utils/rule/learned-patterns";
+import {
+  ActionType,
+  ExecutedActionStatus,
+  ExecutedRuleStatus,
+  GroupItemSource,
+  SystemType,
+} from "@/generated/prisma/enums";
 import { getMockParsedMessage } from "@/__tests__/mocks/email-provider.mock";
 import { learnFromOutlookLabelRemoval } from "@/utils/webhook/outlook/learn-label-removal";
 import { createTestLogger } from "@/__tests__/helpers";
@@ -19,6 +28,7 @@ vi.mock("@/utils/prisma", () => ({
 
 vi.mock("@/utils/rule/learned-patterns", () => ({
   saveLearnedPattern: vi.fn().mockResolvedValue(undefined),
+  removeAiLearnedPattern: vi.fn().mockResolvedValue(0),
 }));
 
 const logger = createTestLogger();
@@ -65,6 +75,75 @@ describe("learnFromOutlookLabelRemoval", () => {
         threadId: "thread-123",
         reason: "Label removed",
         source: GroupItemSource.LABEL_REMOVED,
+      }),
+    );
+  });
+
+  it("drops the AI-learned pattern when a custom rule's label is removed", async () => {
+    vi.mocked(prisma.executedRule.findMany).mockResolvedValue([
+      {
+        rule: { id: "rule-custom", systemType: null },
+        actionItems: [
+          { type: ActionType.LABEL, labelId: "label-custom", label: "Custom" },
+        ],
+      },
+    ] as any);
+
+    const message = getMockParsedMessage({
+      id: "message-123",
+      threadId: "thread-123",
+      labelIds: ["INBOX"],
+      headers: { from: "sender@example.com" },
+    });
+
+    await learnFromOutlookLabelRemoval({
+      message,
+      emailAccountId: "email-account-123",
+      logger,
+    });
+
+    expect(
+      vi.mocked(prisma.executedRule.findMany).mock.calls[0][0]?.where,
+    ).not.toHaveProperty("rule");
+    expect(removeAiLearnedPattern).toHaveBeenCalledWith({
+      emailAccountId: "email-account-123",
+      from: "sender@example.com",
+      ruleId: "rule-custom",
+    });
+    expect(saveLearnedPattern).not.toHaveBeenCalled();
+  });
+
+  it("only considers successfully applied executions for removal learning", async () => {
+    const message = getMockParsedMessage({
+      id: "message-123",
+      threadId: "thread-123",
+      labelIds: ["INBOX"],
+      headers: { from: "sender@example.com" },
+    });
+
+    await learnFromOutlookLabelRemoval({
+      message,
+      emailAccountId: "email-account-123",
+      logger,
+    });
+
+    expect(prisma.executedRule.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: expect.objectContaining({
+          actionItems: expect.objectContaining({
+            where: expect.objectContaining({
+              executionStatus: ExecutedActionStatus.SUCCEEDED,
+            }),
+          }),
+        }),
+        where: expect.objectContaining({
+          actionItems: expect.objectContaining({
+            some: expect.objectContaining({
+              executionStatus: ExecutedActionStatus.SUCCEEDED,
+            }),
+          }),
+          status: ExecutedRuleStatus.APPLIED,
+        }),
       }),
     );
   });

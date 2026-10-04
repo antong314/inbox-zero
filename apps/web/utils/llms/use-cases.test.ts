@@ -26,7 +26,7 @@ vi.mock("@ai-sdk/amazon-bedrock", () => ({
 }));
 
 vi.mock("@ai-sdk/google", () => ({
-  createGoogleGenerativeAI: vi.fn(() => (model: string) => ({ model })),
+  createGoogle: vi.fn(() => (model: string) => ({ model })),
 }));
 
 vi.mock("@ai-sdk/google-vertex", () => ({
@@ -55,6 +55,10 @@ vi.mock("@ai-sdk/openai-compatible", () => ({
   createOpenAICompatible: vi.fn(() => (model: string) => ({ model })),
 }));
 
+vi.mock("@ai-sdk/cerebras", () => ({
+  createCerebras: vi.fn(() => (model: string) => ({ model })),
+}));
+
 vi.mock("@/env", () => ({
   env: {
     DEFAULT_LLMS: "openrouter:openai/gpt-5.4-mini,openai:gpt-5.4-mini",
@@ -80,6 +84,7 @@ vi.mock("@/env", () => ({
     GOOGLE_APPLICATION_CREDENTIALS: undefined,
     ANTHROPIC_API_KEY: "test-anthropic-key",
     GROQ_API_KEY: "test-groq-key",
+    CEREBRAS_API_KEY: "test-cerebras-key",
     OPENROUTER_API_KEY: "test-openrouter-key",
     AI_GATEWAY_API_KEY: "test-ai-gateway-key",
     OLLAMA_BASE_URL: "http://localhost:11434/api",
@@ -129,20 +134,24 @@ describe("LLM use cases", () => {
       [LlmUseCase.EmailReportResponsePatterns]: "default",
       [LlmUseCase.EmailReportSummaryGeneration]: "economy",
       [LlmUseCase.EmailReportUserPersona]: "default",
-      [LlmUseCase.FindSnippets]: "chat",
       [LlmUseCase.KnowledgeExtraction]: "economy",
       [LlmUseCase.LearnedWritingStyleCompaction]: "economy",
       [LlmUseCase.McpAgent]: "economy",
       [LlmUseCase.MeetingBriefing]: "default",
+      [LlmUseCase.MeetingFollowUpDraft]: "draft",
+      [LlmUseCase.MeetingSummary]: "default",
       [LlmUseCase.MeetingWebSearch]: "economy",
       [LlmUseCase.ParseFilingReply]: "economy",
       [LlmUseCase.PersonaAnalysis]: "economy",
       [LlmUseCase.PromptToRules]: "chat",
+      [LlmUseCase.PromptToSplit]: "economy",
       [LlmUseCase.ReplyContextCollector]: "economy",
       [LlmUseCase.ReplyMemoryExtraction]: "economy",
       [LlmUseCase.ReplyMemorySelection]: "economy",
       [LlmUseCase.ReplyNudge]: "chat",
       [LlmUseCase.Summarise]: "default",
+      [LlmUseCase.TranslateEmail]: "economy",
+      [LlmUseCase.UnsubscribePageState]: "economy",
       [LlmUseCase.WritingStyleAnalysis]: "default",
     });
   });
@@ -158,16 +167,6 @@ describe("LLM use cases", () => {
     expect(modelSnapshot(getModelForUseCase(userAi, useCase))).toEqual(
       modelSnapshot(getModel(userAi, modelType)),
     );
-  });
-
-  it("preserves the online model variant option", () => {
-    const userAi = defaultUserAi();
-
-    expect(
-      modelSnapshot(
-        getModelForUseCase(userAi, LlmUseCase.MeetingWebSearch, true),
-      ),
-    ).toEqual(modelSnapshot(getModel(userAi, "economy", true)));
   });
 });
 

@@ -8,6 +8,7 @@ const mockEnv = vi.hoisted(() => ({
   POSTHOG_PROJECT_ID: "project-1",
   POSTHOG_FEEDBACK_SURVEY_ID: "survey-1" as string | undefined,
   POSTHOG_FEEDBACK_SURVEY_QUESTION_ID: "question-1" as string | undefined,
+  EMAIL_ENCRYPT_SALT: "test-encryption-salt",
   NODE_ENV: "test",
 }));
 
@@ -16,17 +17,27 @@ vi.mock("@/env", () => ({
 }));
 
 const captureMock = vi.fn();
-const shutdownMock = vi.fn().mockResolvedValue(undefined);
+const flushMock = vi.fn().mockResolvedValue(undefined);
+const shutdownMock = vi.fn();
+const getFeatureFlagMock = vi.fn();
+const { afterMock } = vi.hoisted(() => ({
+  afterMock: vi.fn((callback: () => unknown) => callback()),
+}));
 
 vi.mock("posthog-node", () => ({
   PostHog: class PostHogMock {
     capture = captureMock;
+    flush = flushMock;
     shutdown = shutdownMock;
+    getFeatureFlag = getFeatureFlagMock;
   },
 }));
 
+vi.mock("next/server", () => ({ after: afterMock }));
+
 vi.mock("@/utils/redis", () => ({
   redis: {
+    del: vi.fn(),
     set: vi.fn(),
   },
 }));
@@ -36,8 +47,14 @@ vi.mock("@/utils/prisma");
 import {
   FIRST_TIME_EVENTS,
   deletePosthogUser,
+  getCheckoutSessionIdHash,
+  getServerFeatureFlagVariant,
+  posthogCaptureEvent,
+  trackBillingCancellationInitiated,
+  trackBillingTrialConverted,
   trackFirstTimeEvent,
   trackProductFeedback,
+  trackStripeCheckoutCreated,
   trackUserDeleted,
   trackUserDeletionRequested,
 } from "./posthog";
@@ -267,5 +284,168 @@ describe("trackProductFeedback", () => {
       properties: { feedback: "Still useful" },
       sendFeatureFlags: undefined,
     });
+  });
+});
+
+describe("trackStripeCheckoutCreated", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("captures only once for a replayed Stripe Checkout Session", async () => {
+    vi.mocked(redis.set)
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce(null);
+
+    await trackStripeCheckoutCreated("user@example.com", "cs_test", {
+      tier: "BASIC_MONTHLY",
+    });
+    await trackStripeCheckoutCreated("user@example.com", "cs_test", {
+      tier: "BASIC_MONTHLY",
+    });
+
+    expect(redis.set).toHaveBeenCalledTimes(2);
+    expect(redis.set).toHaveBeenCalledWith(
+      "posthog:stripe-checkout-created:cs_test",
+      "1",
+      { nx: true, ex: 172_800 },
+    );
+    expect(captureMock).toHaveBeenCalledTimes(1);
+    expect(captureMock).toHaveBeenCalledWith({
+      distinctId: "user@example.com",
+      event: "Stripe checkout created",
+      properties: {
+        checkoutSessionIdHash: getCheckoutSessionIdHash("cs_test"),
+        tier: "BASIC_MONTHLY",
+      },
+      sendFeatureFlags: undefined,
+    });
+  });
+
+  it("captures when Redis is unavailable", async () => {
+    vi.mocked(redis.set).mockRejectedValue(new Error("Redis unavailable"));
+
+    await trackStripeCheckoutCreated("user@example.com", "cs_test", {
+      tier: "BASIC_MONTHLY",
+    });
+
+    expect(captureMock).toHaveBeenCalledTimes(1);
+    expect(redis.del).not.toHaveBeenCalled();
+  });
+
+  it("releases the dedupe reservation when PostHog capture fails", async () => {
+    vi.mocked(redis.set).mockResolvedValue("OK");
+    flushMock.mockRejectedValueOnce(new Error("PostHog unavailable"));
+
+    await trackStripeCheckoutCreated("user@example.com", "cs_test", {
+      tier: "BASIC_MONTHLY",
+    });
+
+    expect(redis.del).toHaveBeenCalledWith(
+      "posthog:stripe-checkout-created:cs_test",
+    );
+  });
+});
+
+describe("posthogCaptureEvent", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("does not fail a delivered event when shutdown cleanup rejects", async () => {
+    const shutdownResult = Promise.reject(new Error("Shutdown unavailable"));
+    shutdownResult.catch(() => undefined);
+    const catchSpy = vi.spyOn(shutdownResult, "catch");
+    shutdownMock.mockReturnValueOnce(shutdownResult);
+
+    await expect(
+      posthogCaptureEvent("user@example.com", "Test event"),
+    ).resolves.toBe(true);
+
+    expect(catchSpy).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Stripe billing outcome events", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("captures the paid trial conversion event used by experiments", async () => {
+    await trackBillingTrialConverted("user@example.com", {
+      subscriptionId: "sub_test",
+    });
+
+    expect(captureMock).toHaveBeenCalledWith({
+      distinctId: "user@example.com",
+      event: "billing_trial_converted",
+      properties: {
+        subscriptionId: "sub_test",
+        $set: {
+          premium: true,
+          premiumTier: "subscription",
+          premiumStatus: "active",
+        },
+      },
+      sendFeatureFlags: undefined,
+    });
+  });
+
+  it("captures the scheduled cancellation event used by experiments", async () => {
+    await trackBillingCancellationInitiated("user@example.com", {
+      subscriptionId: "sub_test",
+    });
+
+    expect(captureMock).toHaveBeenCalledWith({
+      distinctId: "user@example.com",
+      event: "billing_cancellation_initiated",
+      properties: { subscriptionId: "sub_test" },
+      sendFeatureFlags: undefined,
+    });
+  });
+});
+
+describe("getServerFeatureFlagVariant", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns the variant and flushes the exposure after the response", async () => {
+    getFeatureFlagMock.mockResolvedValue("paywall-first");
+
+    const variant = await getServerFeatureFlagVariant({
+      key: "onboarding-paywall-first",
+      distinctId: "user@example.com",
+    });
+
+    expect(variant).toBe("paywall-first");
+    expect(getFeatureFlagMock).toHaveBeenCalledWith(
+      "onboarding-paywall-first",
+      "user@example.com",
+    );
+    expect(afterMock).toHaveBeenCalledOnce();
+    expect(flushMock).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to undefined when the lookup fails", async () => {
+    getFeatureFlagMock.mockRejectedValue(new Error("network"));
+
+    expect(
+      await getServerFeatureFlagVariant({
+        key: "onboarding-paywall-first",
+        distinctId: "user@example.com",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("treats boolean flags as no variant", async () => {
+    getFeatureFlagMock.mockResolvedValue(true);
+
+    expect(
+      await getServerFeatureFlagVariant({
+        key: "integration-actions",
+        distinctId: "user@example.com",
+      }),
+    ).toBeUndefined();
   });
 });

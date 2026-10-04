@@ -162,7 +162,7 @@ describe("reply-memory", () => {
         scopeType: ReplyMemoryScopeType.GLOBAL,
       },
       orderBy: { updatedAt: "desc" },
-      take: 25,
+      take: 100,
     });
     expect(prisma.replyMemory.findMany).toHaveBeenNthCalledWith(
       4,
@@ -1624,7 +1624,7 @@ Can you send pricing?`,
       existingMemories: [],
     });
 
-    const systemPrompt = mockGenerateObject.mock.calls[0]?.[0]?.system;
+    const systemPrompt = mockGenerateObject.mock.calls[0]?.[0]?.instructions;
     expect(systemPrompt).not.toContain("- DOMAIN: applies");
     expect(systemPrompt).toContain("DOMAIN scope is unavailable");
     expect(result).toEqual([]);

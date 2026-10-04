@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { addMinutes } from "date-fns";
+import { getAccountTimezone } from "@/utils/timezone";
 import {
   generateBookableSlots,
   validateSelectedSlot,
@@ -50,7 +51,7 @@ export async function getPublicBookingLinkMetadata(slug: string) {
       durationMinutes: true,
       locationType: true,
       emailAccount: {
-        select: { name: true },
+        select: { name: true, image: true },
       },
     },
   });
@@ -65,6 +66,7 @@ export async function getPublicBookingLinkMetadata(slug: string) {
     locationType: link.locationType,
     locationValue: null,
     hostName: link.emailAccount.name ?? null,
+    hostImage: link.emailAccount.image ?? null,
   };
 }
 
@@ -444,7 +446,7 @@ export async function reschedulePublicBooking({
         providerEventId: booking.providerEventId,
         startTime: newStartTime,
         endTime: newEndTime,
-        timezone: booking.bookingLink.availabilitySchedule.timezone,
+        timezone: getAccountTimezone(booking.bookingLink.emailAccount.timezone),
         logger,
       });
     } catch (error) {
@@ -530,7 +532,7 @@ export async function getPublicBookingForManagement({
           locationType: true,
           locationValue: true,
           emailAccount: {
-            select: { name: true },
+            select: { name: true, image: true },
           },
         },
       },
@@ -554,6 +556,7 @@ export async function getPublicBookingForManagement({
       locationType: booking.bookingLink.locationType,
       locationValue: booking.bookingLink.locationValue,
       hostName: booking.bookingLink.emailAccount.name ?? null,
+      hostImage: booking.bookingLink.emailAccount.image ?? null,
     },
   };
 }
@@ -599,11 +602,8 @@ function getBookingHostInclude() {
         title: true,
         locationType: true,
         locationValue: true,
-        availabilitySchedule: {
-          select: { timezone: true },
-        },
         emailAccount: {
-          select: { email: true, name: true },
+          select: { email: true, name: true, timezone: true },
         },
       },
     },
@@ -626,7 +626,6 @@ async function loadPublicBookingLink(slug: string) {
       destinationCalendarId: true,
       availabilitySchedule: {
         select: {
-          timezone: true,
           windows: {
             select: {
               weekday: true,
@@ -639,6 +638,7 @@ async function loadPublicBookingLink(slug: string) {
       emailAccount: {
         select: {
           name: true,
+          timezone: true,
           calendarConnections: {
             where: { isConnected: true },
             select: {
@@ -675,7 +675,7 @@ async function loadPublicBookingLink(slug: string) {
 
   return {
     link,
-    timezone: link.availabilitySchedule.timezone,
+    timezone: getAccountTimezone(link.emailAccount.timezone),
     windows: link.availabilitySchedule.windows.map((window) => ({
       weekday: window.weekday,
       startMinutes: window.startMinutes,

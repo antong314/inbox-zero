@@ -58,6 +58,8 @@ import {
   expandPromptCommand,
   getHelpText,
   isHelpCommand,
+  isTelegramStartCommand,
+  isUnsupportedSlashCommand,
 } from "@/utils/messaging/prompt-commands";
 import {
   FOLLOW_UP_REMINDER_ACTION_IDS,
@@ -81,6 +83,7 @@ import { isDuplicateError } from "@/utils/prisma-helpers";
 import prisma from "@/utils/prisma";
 import {
   getEmailUrlForMessage,
+  getOpenInMailboxLabel,
   getEmailUrlForOptionalMessage,
 } from "@/utils/url";
 import { getEmailAccountWithAi } from "@/utils/user/get";
@@ -572,6 +575,13 @@ async function processMessagingAssistantMessage({
     logger,
   });
   if (helpCommandHandled) return true;
+
+  const unsupportedCommandHandled = await handleUnsupportedCommand({
+    thread,
+    message,
+    logger,
+  });
+  if (unsupportedCommandHandled) return true;
 
   const clearProcessingReaction = await startSlackProcessingReaction({
     adapters,
@@ -1371,7 +1381,7 @@ export function getPendingEmailHandledStatus(
   actionType: AssistantPendingEmailActionType,
 ) {
   if (actionType === "send_email") return "Email sent.";
-  if (actionType === "reply_email") return "Reply sent.";
+  if (actionType === "reply_email") return "Reply sent. ✅";
   return "Email forwarded.";
 }
 
@@ -1422,12 +1432,10 @@ function getPendingEmailHandledOpenLink({
     accountEmail,
     accountProvider || undefined,
   );
-  const mailbox = accountProvider === "microsoft" ? "Outlook" : "Gmail";
+  const label = getOpenInMailboxLabel(accountProvider);
+  if (!label) return null;
 
-  return {
-    label: `Open in ${mailbox}`,
-    url: emailUrl,
-  };
+  return { label, url: emailUrl };
 }
 
 function getMessagingCardText({
@@ -1846,7 +1854,7 @@ async function handleMessagingLinkCommand({
   await postMessagingThreadMessage({
     thread,
     logger,
-    message: `Connected successfully. You can now chat with your Inbox Zero assistant in this ${provider} DM.`,
+    message: `Connected successfully. You can now chat with your Inbox Zero assistant in this ${provider === "teams" ? "Microsoft Teams" : "Telegram"} direct message. Type \`/help\` to see what I can do.`,
     errorLogMessage: "Failed to send messaging link confirmation",
     logMeta: {
       provider,
@@ -1993,7 +2001,10 @@ async function handleHelpCommand({
 }): Promise<boolean> {
   const provider = thread.adapter.name;
   if (provider !== "telegram" && provider !== "teams") return false;
-  if (!isHelpCommand(message.text)) return false;
+  const isHelp =
+    isHelpCommand(message.text) ||
+    (provider === "telegram" && isTelegramStartCommand(message.text));
+  if (!isHelp) return false;
 
   if (!thread.isDM) {
     await sendDmRequiredMessage({ provider, thread, logger });
@@ -2003,8 +2014,41 @@ async function handleHelpCommand({
   await postMessagingThreadMessage({
     thread,
     logger,
-    message: getHelpText(provider),
+    message: getHelpText(provider, {
+      baseUrl: env.NEXT_PUBLIC_BASE_URL,
+      supportEmail: env.NEXT_PUBLIC_SUPPORT_EMAIL,
+    }),
     errorLogMessage: `Failed to send ${provider} help command response`,
+    logMeta: { provider },
+  });
+
+  return true;
+}
+
+async function handleUnsupportedCommand({
+  thread,
+  message,
+  logger,
+}: {
+  thread: MessagingThread;
+  message: Message;
+  logger: Logger;
+}): Promise<boolean> {
+  const provider = thread.adapter.name;
+  if (provider !== "telegram" && provider !== "teams") return false;
+  if (!isUnsupportedSlashCommand(message.text)) return false;
+
+  if (!thread.isDM) {
+    await sendDmRequiredMessage({ provider, thread, logger });
+    return true;
+  }
+
+  await postMessagingThreadMessage({
+    thread,
+    logger,
+    message:
+      "Sorry, I don't recognize that command. Type `/help` to see the commands I support.",
+    errorLogMessage: `Failed to send ${provider} unsupported command response`,
     logMeta: { provider },
   });
 
@@ -2562,12 +2606,23 @@ async function sendLinkRequiredMessage({
   thread: MessagingThread;
   logger: Logger;
 }): Promise<void> {
-  const providerName = provider === "teams" ? "Teams" : "Telegram";
+  const providerName = provider === "teams" ? "Microsoft Teams" : "Telegram";
+  const baseUrl = env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, "");
 
   await postMessagingThreadMessage({
     thread,
     logger,
-    message: `Your ${providerName} account is not linked yet. In Inbox Zero settings, generate a ${providerName} connect code and send \`/connect <code>\` in this DM.`,
+    message: [
+      `Welcome to Inbox Zero for ${providerName}. I can help you summarize, organize, and draft replies to email from this chat.`,
+      "An active Inbox Zero account is required.",
+      "",
+      "To get started:",
+      `1. Sign in or create an account at ${baseUrl}.`,
+      `2. Open ${baseUrl}/channels and choose ${providerName}.`,
+      "3. Generate a connect code and send `/connect <code>` in this direct message.",
+      "",
+      `Type \`/help\` for supported commands or contact ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`,
+    ].join("\n"),
     errorLogMessage: "Failed to send link-required message",
     logMeta: { provider },
   });

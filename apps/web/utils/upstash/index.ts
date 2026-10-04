@@ -3,17 +3,21 @@ import { after } from "next/server";
 import { getInternalApiHeaders, getInternalApiUrl } from "@/utils/internal-api";
 import { env } from "@/env";
 import { createScopedLogger } from "@/utils/logger";
-import { isSafeExternalHttpUrl } from "@/utils/network/safe-http-url";
+import { isSafeExternalHttpUrl } from "@inboxzero/network/safe-url";
 
 const logger = createScopedLogger("upstash");
 
-function getQstashClient() {
+type PublishToQstashOptions = {
+  destinationUrl?: string;
+};
+
+function getQstashClient(callbackUrl: string = getQstashCallbackBaseUrl()) {
   if (!env.QSTASH_TOKEN) return null;
-  if (!isSafeExternalHttpUrl(getQstashCallbackBaseUrl())) {
+  if (!isSafeExternalHttpUrl(callbackUrl)) {
     logger.warn(
       "Qstash callback URL is not externally reachable; using fallback",
       {
-        qstashCallbackBaseUrl: getQstashCallbackBaseUrl(),
+        qstashCallbackUrl: callbackUrl,
       },
     );
     return null;
@@ -26,13 +30,15 @@ export async function publishToQstash<T>(
   body: T,
   flowControl?: FlowControl,
   headers?: HeadersInit,
+  options?: PublishToQstashOptions,
 ) {
   const requestHeaders = createHeaders(headers);
   requestHeaders.set("Retry-After", "10");
 
-  const client = getQstashClient();
+  const qstashUrl =
+    options?.destinationUrl ?? `${getQstashCallbackBaseUrl()}${path}`;
+  const client = getQstashClient(qstashUrl);
   if (client) {
-    const qstashUrl = `${getQstashCallbackBaseUrl()}${path}`;
     return client.publishJSON({
       url: qstashUrl,
       body,
@@ -42,8 +48,42 @@ export async function publishToQstash<T>(
     });
   }
 
-  const fallbackUrl = `${getInternalApiUrl()}${path}`;
-  return fallbackPublishToQstash(fallbackUrl, body, requestHeaders);
+  const fallbackUrl =
+    options?.destinationUrl ?? `${getInternalApiUrl()}${path}`;
+  return fallbackPublishToQstash(
+    fallbackUrl,
+    body,
+    requestHeaders,
+    !options?.destinationUrl,
+  );
+}
+
+/**
+ * Delivers `body` to `path` no earlier than `notBefore`. Resolves `false` when
+ * QStash is unavailable, so callers keep their own fallback, such as the cron.
+ */
+export async function publishToQstashAt<T>({
+  path,
+  body,
+  notBefore,
+  deduplicationId,
+}: {
+  path: string;
+  body: T;
+  notBefore: Date;
+  deduplicationId: string;
+}) {
+  const url = `${getQstashCallbackBaseUrl()}${path}`;
+  const client = getQstashClient(url);
+  if (!client) return false;
+  await client.publishJSON({
+    url,
+    body,
+    notBefore: Math.ceil(notBefore.getTime() / 1000),
+    deduplicationId,
+    retries: 3,
+  });
+  return true;
 }
 
 export async function bulkPublishToQstash<T>({
@@ -84,12 +124,14 @@ export async function publishToQstashQueue<T>({
   path,
   body,
   headers,
+  deduplicationId,
 }: {
   queueName: string;
   parallelism: number;
   path: string;
   body: T;
   headers?: HeadersInit;
+  deduplicationId?: string;
 }) {
   const client = getQstashClient();
   if (client) {
@@ -98,7 +140,12 @@ export async function publishToQstashQueue<T>({
     try {
       const queue = client.queue({ queueName });
       await queue.upsert({ parallelism });
-      return await queue.enqueueJSON({ url: qstashUrl, body, headers });
+      return await queue.enqueueJSON({
+        url: qstashUrl,
+        body,
+        headers,
+        deduplicationId,
+      });
     } catch (error) {
       logger.error("Failed to publish to Qstash queue", {
         qstashUrl,
@@ -133,13 +180,16 @@ async function fallbackPublishToQstash<T>(
   url: string,
   body: T,
   headers?: HeadersInit,
+  includeInternalApiHeaders = true,
 ) {
   logger.warn("Qstash client not found");
 
   const internalHeaders = createHeaders(headers);
   internalHeaders.set("Content-Type", "application/json");
-  for (const [key, value] of Object.entries(getInternalApiHeaders())) {
-    internalHeaders.set(key, value);
+  if (includeInternalApiHeaders) {
+    for (const [key, value] of Object.entries(getInternalApiHeaders())) {
+      internalHeaders.set(key, value);
+    }
   }
 
   after(async () => {

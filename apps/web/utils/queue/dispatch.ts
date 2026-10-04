@@ -13,21 +13,27 @@ export async function enqueueBackgroundJob<T>({
   topic,
   body,
   qstash,
+  vercel,
   logger,
 }: {
   topic: string;
   body: T;
+  vercel?: {
+    // Vercel Queues has no per-topic parallelism cap, so large fan-outs spread delivery out instead.
+    delaySeconds?: number;
+  };
   qstash: {
     queueName: string;
     parallelism: number;
     path: string;
     headers?: HeadersInit;
+    deduplicationId?: string;
   };
   logger: Logger;
 }) {
   if (isVercelQueueDispatchEnabled()) {
     try {
-      await send(topic, body);
+      await send(topic, body, { delaySeconds: vercel?.delaySeconds });
       return "vercel";
     } catch (error) {
       logger.error("Failed to enqueue Vercel queue message", {
@@ -73,6 +79,7 @@ export async function enqueueBackgroundJob<T>({
     path: qstash.path,
     body,
     headers: qstash.headers,
+    deduplicationId: qstash.deduplicationId,
   });
 
   return env.QSTASH_TOKEN ? "qstash" : "internal-fallback";

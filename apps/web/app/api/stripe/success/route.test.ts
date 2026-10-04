@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import prisma from "@/utils/__mocks__/prisma";
 
-const { afterMock, redirectMock, syncStripeDataToDbMock } = vi.hoisted(() => ({
+const {
+  afterMock,
+  redirectMock,
+  syncStripeDataToDbMock,
+  trackStripeCheckoutCompletedMock,
+} = vi.hoisted(() => ({
   afterMock: vi.fn(),
   redirectMock: vi.fn(),
   syncStripeDataToDbMock: vi.fn(),
+  trackStripeCheckoutCompletedMock: vi.fn(),
 }));
 
 vi.mock("next/server", async (importActual) => ({
@@ -41,7 +47,7 @@ vi.mock("@/ee/billing/stripe/sync-stripe", () => ({
 }));
 
 vi.mock("@/utils/posthog", () => ({
-  trackStripeCheckoutCompleted: vi.fn(),
+  trackStripeCheckoutCompleted: trackStripeCheckoutCompletedMock,
 }));
 
 import { GET } from "./route";
@@ -67,6 +73,43 @@ describe("stripe success route", () => {
       customerId: "stripe-customer-id",
       logger: expect.anything(),
     });
+    expect(redirectMock).toHaveBeenCalledWith(
+      "/setup?conversion_event=trial_started&conversion_event_id=checkout-session-id",
+    );
+
+    const trackCheckoutCompleted = afterMock.mock.calls[0]?.[0];
+    expect(trackCheckoutCompleted).toEqual(expect.any(Function));
+    await trackCheckoutCompleted();
+
+    expect(trackStripeCheckoutCompletedMock).toHaveBeenCalledWith(
+      "user@example.com",
+      {
+        source: "success_redirect",
+      },
+    );
+  });
+
+  it("returns paywall-first users to onboarding after checkout", async () => {
+    await GET(
+      new Request(
+        "http://localhost:3000/api/stripe/success?session_id=checkout-session-id&returnTo=onboarding",
+      ) as never,
+      {} as never,
+    );
+
+    expect(redirectMock).toHaveBeenCalledWith(
+      "/onboarding?conversion_event=trial_started&conversion_event_id=checkout-session-id",
+    );
+  });
+
+  it("ignores unknown return destinations", async () => {
+    await GET(
+      new Request(
+        "http://localhost:3000/api/stripe/success?session_id=checkout-session-id&returnTo=https://evil.example",
+      ) as never,
+      {} as never,
+    );
+
     expect(redirectMock).toHaveBeenCalledWith(
       "/setup?conversion_event=trial_started&conversion_event_id=checkout-session-id",
     );

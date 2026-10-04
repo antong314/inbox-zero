@@ -1,4 +1,19 @@
-import { SYSTEM_RULE_ORDER } from "@/utils/rule/consts";
+import { SystemType } from "@/generated/prisma/enums";
+import { isOptInSystemType } from "@/utils/rule/consts";
+
+export const SYSTEM_RULE_ORDER: SystemType[] = [
+  SystemType.TO_REPLY,
+  SystemType.AWAITING_REPLY,
+  SystemType.FYI,
+  SystemType.ACTIONED,
+  SystemType.NEWSLETTER,
+  SystemType.MARKETING,
+  SystemType.CALENDAR,
+  SystemType.RECEIPT,
+  SystemType.NOTIFICATION,
+  SystemType.OTP,
+  SystemType.COLD_EMAIL,
+];
 
 type SortableRule = {
   enabled?: boolean | null;
@@ -7,7 +22,16 @@ type SortableRule = {
   instructions?: string | null;
 };
 
-export function sortRulesForAutomation<T extends SortableRule>(
+/** Opt-in system rules stay off the Rules list until the user turns them on. */
+export function shouldShowSystemRule(
+  systemType: SystemType,
+  existing?: { enabled?: boolean | null } | null,
+) {
+  if (!isOptInSystemType(systemType)) return true;
+  return existing?.enabled === true;
+}
+
+export function sortRulesByCanonicalOrder<T extends SortableRule>(
   rules: T[],
 ): T[] {
   return [...rules].sort((a, b) => {

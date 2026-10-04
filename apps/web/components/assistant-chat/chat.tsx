@@ -3,12 +3,10 @@
 import type { ChangeEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowUpIcon,
   HistoryIcon,
   Loader2,
   PaperclipIcon,
   PlusIcon,
-  SquareIcon,
   XIcon,
 } from "lucide-react";
 import { Messages } from "./messages";
@@ -43,6 +41,9 @@ import {
 } from "@/components/assistant-chat/chat-history-types";
 import { RenameChatDialog } from "@/components/assistant-chat/RenameChatDialog";
 import { DeleteChatDialog } from "@/components/assistant-chat/DeleteChatDialog";
+import { randomUuid } from "@/utils/uuid";
+import { VoiceInput } from "@/components/voice/VoiceInput";
+import { liveHistoryFromUiMessages } from "@/utils/voice/live-history";
 
 const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB
 const MAX_FILES = 5;
@@ -73,6 +74,7 @@ export function Chat({
     setContext,
     attachments,
     setAttachments,
+    submitTextMessage,
   } = useChat();
   const { messages, status, stop, regenerate, setMessages } = chat;
   const [localStorageInput, setLocalStorageInput] = useLocalStorage(
@@ -116,7 +118,7 @@ export function Chat({
         const reader = new FileReader();
         reader.onload = () => {
           resolve({
-            id: crypto.randomUUID(),
+            id: randomUuid(),
             name: file.name,
             url: reader.result as string,
             contentType: file.type,
@@ -191,7 +193,7 @@ export function Chat({
     <PromptInput
       onSubmit={(e) => {
         e.preventDefault();
-        if (hasContent && status === "ready") {
+        if (hasContent && (status === "ready" || status === "error")) {
           analytics.captureAction("chat_message_submitted", {
             has_text: input.trim().length > 0,
             attachment_count: attachments.length,
@@ -199,10 +201,8 @@ export function Chat({
             message_count: messages.length,
           });
           handleSubmit();
-          setLocalStorageInput("");
         }
       }}
-      className="relative divide-y-0 rounded-2xl"
     >
       {(attachments.length > 0 || uploadQueue.length > 0) && (
         <div className="flex gap-2 overflow-x-auto p-2 pb-0">
@@ -233,7 +233,7 @@ export function Chat({
           setInput(e.currentTarget.value)
         }
         onPaste={handlePaste}
-        className="pr-24"
+        className="pr-48"
       />
 
       <input
@@ -247,12 +247,30 @@ export function Chat({
       />
 
       <div className="absolute bottom-2 right-2 flex items-center gap-1">
+        <VoiceInput
+          liveEnabled
+          liveHistory={liveHistoryFromUiMessages(messages)}
+          onInsert={(text) => {
+            setInput(input.trim() ? `${input.trim()} ${text}` : text);
+          }}
+          onSend={(text) => {
+            analytics.captureAction("chat_message_submitted", {
+              has_text: true,
+              attachment_count: attachments.length,
+              has_context: Boolean(context),
+              message_count: messages.length,
+              via_voice: true,
+            });
+            submitTextMessage(text).catch(() => undefined);
+          }}
+        />
         <Tooltip content="Attach images">
           <Button
             type="button"
-            variant="ghost"
+            variant="ghostMuted"
             size="icon"
-            className="size-9 rounded-full text-muted-foreground hover:text-foreground"
+            aria-label="Attach images"
+            className="size-9 rounded-full"
             onClick={() => {
               analytics.captureAction("chat_attach_button_clicked", {
                 attachment_count: attachments.length,
@@ -273,8 +291,9 @@ export function Chat({
                 ? "submitted"
                 : "ready"
           }
-          disabled={status === "ready" ? !hasContent : status === "error"}
-          className="h-9 w-9 rounded-full bg-blue-500 text-white hover:bg-blue-600"
+          disabled={
+            status === "ready" || status === "error" ? !hasContent : false
+          }
           onClick={(e) => {
             if (status === "streaming" || status === "submitted") {
               analytics.captureAction("chat_generation_stopped", {
@@ -285,15 +304,7 @@ export function Chat({
               setMessages((messages) => messages);
             }
           }}
-        >
-          {status === "submitted" ? (
-            <Loader2 className="size-5 animate-spin" />
-          ) : status === "streaming" ? (
-            <SquareIcon className="size-4" />
-          ) : (
-            <ArrowUpIcon className="size-5" />
-          )}
-        </PromptInputSubmit>
+        />
       </div>
     </PromptInput>
   );

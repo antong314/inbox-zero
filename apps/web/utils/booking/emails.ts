@@ -4,11 +4,12 @@ import {
   sendHostBookingCancellationEmail,
   sendHostBookingConfirmationEmail,
   sendHostBookingRescheduledEmail,
-} from "@inboxzero/resend";
+} from "@inboxzero/transactional-email";
 import { env } from "@/env";
 import type { Logger } from "@/utils/logger";
 import { BookingLinkLocationType } from "@/generated/prisma/enums";
 import { formatDateTimeInUserTimezone } from "@/utils/date";
+import { getAccountTimezone } from "@/utils/timezone";
 
 type BookingEmailPayload = {
   cancellationReason?: string | null;
@@ -23,12 +24,10 @@ type BookingEmailPayload = {
     title: string;
     locationType: BookingLinkLocationType;
     locationValue: string | null;
-    availabilitySchedule: {
-      timezone: string;
-    };
     emailAccount: {
       email: string;
       name?: string | null;
+      timezone: string | null;
     };
   };
 };
@@ -49,7 +48,12 @@ export async function sendBookingConfirmationEmails({
   const link = booking.bookingLink;
   const host = link.emailAccount;
   const location = getLocationLabel(link);
-  const hostTimezone = link.availabilitySchedule.timezone;
+  const hostLocation =
+    link.locationType === BookingLinkLocationType.MICROSOFT_TEAMS &&
+    !booking.videoConferenceLink
+      ? "Microsoft Teams link was not generated"
+      : location;
+  const hostTimezone = getAccountTimezone(host.timezone);
   const guestParts = formatBookingParts({
     startTime: booking.startTime,
     endTime: booking.endTime,
@@ -91,7 +95,7 @@ export async function sendBookingConfirmationEmails({
           formattedTime: hostParts.formattedTime,
           guestEmail: booking.guestEmail,
           guestName: booking.guestName,
-          location,
+          location: hostLocation,
           dateMonth: hostParts.dateMonth,
           dateDay: hostParts.dateDay,
           dateWeekday: hostParts.dateWeekday,
@@ -127,7 +131,7 @@ export async function sendBookingRescheduledEmails({
   const link = booking.bookingLink;
   const host = link.emailAccount;
   const location = getLocationLabel(link);
-  const hostTimezone = link.availabilitySchedule.timezone;
+  const hostTimezone = getAccountTimezone(host.timezone);
   const guestParts = formatBookingParts({
     startTime: booking.startTime,
     endTime: booking.endTime,
@@ -202,7 +206,7 @@ export async function sendBookingCancellationEmails({
 }) {
   const link = booking.bookingLink;
   const host = link.emailAccount;
-  const hostTimezone = link.availabilitySchedule.timezone;
+  const hostTimezone = getAccountTimezone(host.timezone);
 
   try {
     await sendHostBookingCancellationEmail({

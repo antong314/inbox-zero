@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   createSearchParams,
+  getEmailDraftUrl,
   getEmailUrl,
   getEmailUrlForMessage,
   getEmailUrlForOptionalMessage,
@@ -162,6 +163,122 @@ describe("getEmailUrl", () => {
     expect(getEmailUrl(messageOrThreadId, emailAddress, provider)).toBe(
       expected,
     );
+  });
+});
+
+describe("getEmailDraftUrl", () => {
+  it.each([
+    {
+      name: "a business mailbox",
+      emailAddress: "user@contoso.com",
+      webLink:
+        "https://outlook.office365.com/mail/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1",
+      expected:
+        "https://outlook.office365.com/mail/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1&ispopout=0",
+    },
+    {
+      name: "a personal mailbox",
+      emailAddress: "user@outlook.com",
+      webLink:
+        "https://outlook.live.com/mail/0/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1",
+      expected:
+        "https://outlook.live.com/mail/0/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1&ispopout=0",
+    },
+  ])("opens the draft itself within the full Outlook client for $name", ({
+    emailAddress,
+    webLink,
+    expected,
+  }) => {
+    expect(
+      getEmailDraftUrl(
+        { id: "AAMkAG-synthetic_id=", externalUrl: webLink },
+        emailAddress,
+        "microsoft",
+      ),
+    ).toBe(expected);
+  });
+
+  it("renders the Outlook draft in the reading pane rather than a popout", () => {
+    expect(
+      getEmailDraftUrl(
+        {
+          id: "AAMkAG-synthetic_id=",
+          externalUrl:
+            "https://outlook.office365.com/mail/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1&ispopout=1",
+        },
+        "user@contoso.com",
+        "microsoft",
+      ),
+    ).toBe(
+      "https://outlook.office365.com/mail/deeplink/read/AAMkAG%2Fowa%2Bid%3D?ItemID=AAMkAG%2Fowa%2Bid%3D&exvsurl=1&ispopout=0",
+    );
+  });
+
+  it.each([
+    {
+      name: "a host outside Outlook on the web",
+      externalUrl: "https://evil.example.com/mail/deeplink/read/AAMkAG",
+    },
+    {
+      name: "a non-https link",
+      externalUrl: "javascript:alert(1)",
+    },
+    {
+      name: "an unparseable link",
+      externalUrl: "not a url",
+    },
+  ])("falls back to the Drafts folder when Graph reports $name", ({
+    externalUrl,
+  }) => {
+    expect(
+      getEmailDraftUrl(
+        { id: "AAMkAG-synthetic_id=", externalUrl },
+        "user@contoso.com",
+        "microsoft",
+      ),
+    ).toBe("https://outlook.office.com/mail/drafts/id/AAMkAG-synthetic_id%3D");
+  });
+
+  it("falls back to the Drafts folder when Graph omits the web link", () => {
+    expect(
+      getEmailDraftUrl(
+        { id: "AAMkAG-synthetic_id=" },
+        "user@outlook.com",
+        "microsoft",
+      ),
+    ).toBe("https://outlook.live.com/mail/0/drafts/id/AAMkAG-synthetic_id%3D");
+  });
+
+  it("returns null when the Outlook draft has no id to address it by", () => {
+    expect(
+      getEmailDraftUrl({ id: "" }, "user@outlook.com", "microsoft"),
+    ).toBeNull();
+  });
+
+  it.each([
+    {
+      name: "Google account",
+      draft: { id: "draft-message-123", threadId: "thread-123" },
+      emailAddress: "user@gmail.com",
+      provider: "google",
+      expected:
+        "https://mail.google.com/mail/u/?authuser=user%40gmail.com#drafts/thread-123",
+    },
+    {
+      name: "Google account without a thread",
+      draft: { id: "draft-message-123" },
+      emailAddress: "user@gmail.com",
+      provider: "google",
+      expected:
+        "https://mail.google.com/mail/u/?authuser=user%40gmail.com#drafts/draft-message-123",
+    },
+  ])("opens the draft for a $name", ({
+    draft,
+    emailAddress,
+    provider,
+    expected,
+  }) => {
+    expect(getEmailDraftUrl(draft, emailAddress, provider)).toBe(expected);
   });
 });
 

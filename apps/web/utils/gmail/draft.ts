@@ -4,9 +4,13 @@ import { parseMessage } from "@/utils/gmail/message";
 import { GmailLabel } from "@/utils/gmail/label";
 import type { MessageWithPayload } from "@/utils/types";
 import { isGmailError } from "@/utils/error";
-import { withGmailRetry } from "@/utils/gmail/retry";
+import {
+  withGmailRetry,
+  withGmailNonIdempotentWriteRetry,
+} from "@/utils/gmail/retry";
 
 const logger = createScopedLogger("gmail/draft");
+const MAX_DRAFT_LOOKUP_PAGES = 10;
 
 export async function getDraft(draftId: string, gmail: gmail_v1.Gmail) {
   try {
@@ -50,7 +54,7 @@ export async function getDraft(draftId: string, gmail: gmail_v1.Gmail) {
       return null;
     }
 
-    return message;
+    return { ...message, payload: response.data.message?.payload };
   } catch (error) {
     if (isNotFoundError(error)) {
       logger.info("Draft not found, returning null.", { draftId });
@@ -58,6 +62,41 @@ export async function getDraft(draftId: string, gmail: gmail_v1.Gmail) {
     }
     throw error;
   }
+}
+
+export async function getDraftIdForMessage(
+  gmail: gmail_v1.Gmail,
+  messageId: string,
+): Promise<string | null> {
+  // Gmail draft ids (r-NNN) differ from the draft's message id; drafts.list is
+  // the only way to map one to the other.
+  let pageToken: string | undefined;
+  const seenPageTokens = new Set<string>();
+  for (let pageCount = 0; pageCount < MAX_DRAFT_LOOKUP_PAGES; pageCount++) {
+    const response = await withGmailRetry(() =>
+      gmail.users.drafts.list({
+        userId: "me",
+        maxResults: 500,
+        pageToken,
+      }),
+    );
+
+    const draft = response.data.drafts?.find(
+      (draft) => draft.message?.id === messageId,
+    );
+    if (draft?.id) return draft.id;
+
+    const nextPageToken = response.data.nextPageToken ?? undefined;
+    if (!nextPageToken || seenPageTokens.has(nextPageToken)) return null;
+    seenPageTokens.add(nextPageToken);
+    pageToken = nextPageToken;
+  }
+
+  logger.warn("Stopped draft lookup after reaching the page limit", {
+    maxPages: MAX_DRAFT_LOOKUP_PAGES,
+  });
+
+  return null;
 }
 
 function isNotFoundError(error: unknown): boolean {
@@ -93,7 +132,7 @@ export async function sendDraft(
 ): Promise<{ messageId: string; threadId: string }> {
   logger.info("Sending draft", { draftId });
 
-  const response = await withGmailRetry(() =>
+  const response = await withGmailNonIdempotentWriteRetry(() =>
     gmail.users.drafts.send({
       userId: "me",
       requestBody: {
@@ -114,7 +153,10 @@ export async function sendDraft(
   return { messageId, threadId };
 }
 
-export async function deleteDraft(gmail: gmail_v1.Gmail, draftId: string) {
+export async function deleteDraft(
+  gmail: gmail_v1.Gmail,
+  draftId: string,
+): Promise<boolean> {
   // Log detailed info about the draft ID format for debugging
   logger.info("Attempting to delete draft", {
     draftId,
@@ -139,7 +181,7 @@ export async function deleteDraft(gmail: gmail_v1.Gmail, draftId: string) {
       logger.warn("Draft not found or no longer a draft, skipping deletion.", {
         draftId,
       });
-      return;
+      return false;
     }
 
     const response = await withGmailRetry(() =>
@@ -149,17 +191,16 @@ export async function deleteDraft(gmail: gmail_v1.Gmail, draftId: string) {
       }),
     );
     if (response.status !== 200 && response.status !== 204) {
-      logger.error("Unexpected response status from draft deletion", {
-        draftId,
-        status: response.status,
-      });
+      throw new Error(`Unexpected draft deletion status: ${response.status}`);
     }
     logger.info("Successfully deleted draft", { draftId });
+    return true;
   } catch (error) {
     if (isNotFoundError(error)) {
       logger.warn("Draft not found or already deleted, skipping deletion.", {
         draftId,
       });
+      return false;
     } else {
       logger.error("Failed to delete draft", { draftId, error });
       throw error;

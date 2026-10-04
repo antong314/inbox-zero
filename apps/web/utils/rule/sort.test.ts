@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { SystemType } from "@/generated/prisma/enums";
-import { sortRulesForAutomation } from "./sort";
+import { shouldShowSystemRule, sortRulesByCanonicalOrder } from "./sort";
 
-describe("sortRulesForAutomation", () => {
+describe("sortRulesByCanonicalOrder", () => {
   it("puts disabled rules after enabled rules and sorts each group by name", () => {
     const rules = [
       { name: "Zulu", enabled: true },
@@ -11,7 +11,7 @@ describe("sortRulesForAutomation", () => {
       { name: "Charlie", enabled: false },
     ];
 
-    expect(sortRulesForAutomation(rules).map((rule) => rule.name)).toEqual([
+    expect(sortRulesByCanonicalOrder(rules).map((rule) => rule.name)).toEqual([
       "Bravo",
       "Zulu",
       "Alpha",
@@ -27,6 +27,11 @@ describe("sortRulesForAutomation", () => {
         systemType: SystemType.NEWSLETTER,
       },
       {
+        name: "OTP",
+        enabled: true,
+        systemType: SystemType.OTP,
+      },
+      {
         name: "Cold Email",
         enabled: true,
         systemType: SystemType.COLD_EMAIL,
@@ -34,10 +39,28 @@ describe("sortRulesForAutomation", () => {
       { name: "Alpha", enabled: true },
     ];
 
-    expect(sortRulesForAutomation(rules).map((rule) => rule.name)).toEqual([
+    expect(sortRulesByCanonicalOrder(rules).map((rule) => rule.name)).toEqual([
       "Newsletter",
+      "OTP",
       "Cold Email",
       "Alpha",
     ]);
+  });
+});
+
+describe("shouldShowSystemRule", () => {
+  it("keeps standard system rules on the list even when they are missing or off", () => {
+    expect(shouldShowSystemRule(SystemType.NOTIFICATION)).toBe(true);
+    expect(
+      shouldShowSystemRule(SystemType.NOTIFICATION, { enabled: false }),
+    ).toBe(true);
+  });
+
+  it("hides opt-in system rules until they are enabled", () => {
+    expect(shouldShowSystemRule(SystemType.OTP)).toBe(false);
+    expect(shouldShowSystemRule(SystemType.OTP, { enabled: false })).toBe(
+      false,
+    );
+    expect(shouldShowSystemRule(SystemType.OTP, { enabled: true })).toBe(true);
   });
 });

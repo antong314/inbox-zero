@@ -1,9 +1,12 @@
+import { env } from "@/env";
+import { AdminScimCredentials } from "@/app/(app)/admin/AdminScimCredentials";
 import { AdminUpgradeUserForm } from "@/app/(app)/admin/AdminUpgradeUserForm";
 import { AdminUserControls } from "@/app/(app)/admin/AdminUserControls";
 import { auth } from "@/utils/auth";
 import { ErrorPage } from "@/components/ErrorPage";
 import { isAdmin } from "@/utils/admin";
 import {
+  AdminBackfillPremiumAdmins,
   AdminSyncStripe,
   AdminSyncStripeCustomers,
 } from "@/app/(app)/admin/AdminSyncStripe";
@@ -43,10 +46,12 @@ export default async function AdminPage() {
         <GmailUrlConverter />
         <DebugLabels />
         <RegisterSSOModal />
+        {env.SCIM_CREDENTIAL_HASH_SECRET && <AdminScimCredentials />}
 
         <div className="flex gap-2">
           <AdminSyncStripe />
           <AdminSyncStripeCustomers />
+          <AdminBackfillPremiumAdmins />
         </div>
 
         <AdminTopSpenders />

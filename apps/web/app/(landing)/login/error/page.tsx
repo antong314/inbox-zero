@@ -2,7 +2,8 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Suspense, useEffect } from "react";
+import { Suspense, useEffect, useRef } from "react";
+import { usePostHog } from "posthog-js/react";
 import {
   getEmailAlreadyLinkedDescription,
   getRequiresReconsentDescription,
@@ -17,6 +18,10 @@ import { WELCOME_PATH } from "@/utils/config";
 import { CrispChatLoggedOutVisible } from "@/components/CrispChat";
 import { getAndClearAuthErrorCookie } from "@/utils/auth-cookies";
 import { SUPPORT_EMAIL } from "@/utils/branding";
+import {
+  getPendingAuthProvider,
+  trackAuthFailure,
+} from "@/utils/analytics/auth-funnel";
 
 const errorMessages: Record<string, { title: string; description: string }> = {
   email_not_found: {
@@ -32,6 +37,11 @@ const errorMessages: Record<string, { title: string; description: string }> = {
   email_already_linked: {
     title: "Email Already Linked",
     description: getEmailAlreadyLinkedDescription(),
+  },
+  account_not_linked: {
+    title: "Sign-in Method Doesn't Match",
+    description:
+      "An account already exists for this email, but it was created with a different sign-in method or a different provider account. Sign in the way you originally signed up, or contact support so we can reconnect the two.",
   },
   org_invite_invalid_code: {
     title: "Organization Invite Sign-in Failed",
@@ -50,12 +60,25 @@ const errorMessages: Record<string, { title: string; description: string }> = {
 };
 
 function LoginErrorContent() {
+  const posthog = usePostHog();
+  const hasTrackedAuthFailure = useRef(false);
   const { data, isLoading, error } = useUser();
   const router = useRouter();
   const searchParams = useSearchParams();
   const errorCode = searchParams.get("error")?.toLowerCase();
   const reason = searchParams.get("reason")?.toLowerCase();
   const resolvedErrorCode = resolveErrorCode({ errorCode, reason });
+
+  useEffect(() => {
+    if (isLoading || data?.id || hasTrackedAuthFailure.current) return;
+
+    hasTrackedAuthFailure.current = true;
+    trackAuthFailure(posthog, {
+      provider: getPendingAuthProvider(),
+      stage: "callback",
+      errorCode: resolvedErrorCode,
+    });
+  }, [data?.id, isLoading, posthog, resolvedErrorCode]);
 
   // For some reason users are being sent to this page when logged in
   // This will redirect them out of this page to the app

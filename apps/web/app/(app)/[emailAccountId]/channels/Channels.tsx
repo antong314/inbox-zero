@@ -70,7 +70,6 @@ import {
   type MessagingFeatureRoutePurpose,
   type MessagingRouteSummary,
 } from "@/utils/messaging/routes";
-import { sortRulesForAutomation } from "@/utils/rule/sort";
 import {
   type MessagingProvider,
   MessagingRoutePurpose,
@@ -166,8 +165,7 @@ export function Channels() {
     (provider) => provider !== "TEAMS" || teamsEnabled,
   );
   const visibleRules = useMemo(
-    () =>
-      sortRulesForAutomation((rulesData ?? []).filter((rule) => rule.enabled)),
+    () => (rulesData ?? []).filter((rule) => rule.enabled),
     [rulesData],
   );
   const connectedProviders = useMemo(
@@ -389,8 +387,7 @@ function ConnectedChannelSection({
             <DropdownMenuTrigger asChild>
               <Button
                 variant="ghost"
-                size="icon"
-                className="h-6 w-6"
+                size="icon2xs"
                 disabled={disconnectStatus === "executing"}
               >
                 <MoreVerticalIcon className="h-3.5 w-3.5" />
@@ -720,12 +717,7 @@ function RuleToggle({
           {enabled && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  disabled={isExecuting}
-                >
+                <Button variant="ghost" size="iconXs" disabled={isExecuting}>
                   <MoreVerticalIcon className="h-4 w-4" />
                 </Button>
               </DropdownMenuTrigger>
@@ -882,7 +874,7 @@ function FeatureRouteAction({
 
     return (
       <Tooltip content="Open settings">
-        <Button asChild variant="ghost" size="icon" className="h-8 w-8">
+        <Button asChild variant="ghost" size="iconSm">
           <Link href={href}>
             <ChevronRightIcon className="h-4 w-4" />
           </Link>
@@ -894,12 +886,7 @@ function FeatureRouteAction({
   return (
     <>
       <Tooltip content="Configure">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          onClick={() => setOpen(true)}
-        >
+        <Button variant="ghost" size="iconSm" onClick={() => setOpen(true)}>
           <Settings2Icon className="h-4 w-4" />
         </Button>
       </Tooltip>

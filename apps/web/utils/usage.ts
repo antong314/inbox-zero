@@ -84,8 +84,8 @@ export async function saveAiUsage({
       });
   const inputTokens = usage.inputTokens ?? 0;
   const outputTokens = usage.outputTokens ?? 0;
-  const cachedInputTokens = usage.cachedInputTokens ?? 0;
-  const reasoningTokens = usage.reasoningTokens ?? 0;
+  const cachedInputTokens = usage.inputTokenDetails?.cacheReadTokens ?? 0;
+  const reasoningTokens = usage.outputTokenDetails?.reasoningTokens ?? 0;
   const totalTokens = usage.totalTokens ?? 0;
 
   logger.info("AI call completed", {
@@ -127,8 +127,8 @@ export async function saveAiUsage({
     totalTokens,
   });
 
-  try {
-    return Promise.all([
+  const [analyticsResult, redisResult] = await Promise.allSettled([
+    invokeUsageSink(() =>
       publishAiCall({
         userId: userId ?? email,
         emailAccountId,
@@ -150,10 +150,21 @@ export async function saveAiUsage({
         stepCount,
         toolCallCount,
       }),
+    ),
+    invokeUsageSink(() =>
       saveUsage({ userId, emailAccountId, cost: platformCost, usage }),
-    ]);
-  } catch (error) {
-    logger.error("Failed to save usage", { error });
+    ),
+  ]);
+
+  if (analyticsResult.status === "rejected") {
+    logger.error("Failed to publish AI usage analytics", {
+      error: analyticsResult.reason,
+    });
+  }
+  if (redisResult.status === "rejected") {
+    logger.error("Failed to save AI usage to Redis", {
+      error: redisResult.reason,
+    });
   }
 }
 
@@ -166,7 +177,7 @@ export function calculateUsageCost(options: {
   const pricing = getModelPricing({ provider, model });
   if (!pricing) return 0;
 
-  const rawCachedInputTokens = usage.cachedInputTokens ?? 0;
+  const rawCachedInputTokens = usage.inputTokenDetails?.cacheReadTokens ?? 0;
   const normalizedCachedInputTokens = Math.max(0, rawCachedInputTokens);
   const inputTokens = Math.max(
     0,
@@ -175,13 +186,12 @@ export function calculateUsageCost(options: {
   const cachedInputTokens = Math.min(inputTokens, normalizedCachedInputTokens);
   const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens);
   const outputTokens = Math.max(0, usage.outputTokens ?? 0);
-  const reasoningTokens = Math.max(0, usage.reasoningTokens ?? 0);
   const cachedInputTokenPrice = pricing.cachedInput ?? pricing.input;
 
   return (
     uncachedInputTokens * pricing.input +
     cachedInputTokens * cachedInputTokenPrice +
-    (outputTokens + reasoningTokens) * pricing.output
+    outputTokens * pricing.output
   );
 }
 
@@ -285,4 +295,8 @@ function notifyAiUsageListeners(event: AiUsageEvent): void {
 
 function toTinybirdBoolean(value: boolean): 0 | 1 {
   return value ? 1 : 0;
+}
+
+function invokeUsageSink(operation: () => unknown) {
+  return new Promise<unknown>((resolve) => resolve(operation()));
 }

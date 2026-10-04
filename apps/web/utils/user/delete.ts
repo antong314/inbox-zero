@@ -1,7 +1,9 @@
 import { deleteContact as deleteLoopsContact } from "@inboxzero/loops";
-import { deleteContact as deleteResendContact } from "@inboxzero/resend";
+import { deleteContact as deleteResendContact } from "@inboxzero/transactional-email";
+import { withThreadPageBufferDeletion } from "@/utils/redis/thread-page-buffer";
 import prisma from "@/utils/prisma";
-import { deleteTinybirdAiCalls } from "@inboxzero/tinybird-ai-analytics";
+import { deleteTinybirdEmailData } from "@inboxzero/tinybird";
+import { after } from "next/server";
 import {
   deletePosthogUser,
   trackUserDeleted,
@@ -12,6 +14,7 @@ import { unwatchEmails } from "@/utils/email/watch-manager";
 import { createEmailProvider } from "@/utils/email/provider";
 import type { EmailProvider } from "@/utils/email/types";
 import type { Logger } from "@/utils/logger";
+import { deleteAccountUploadDirectory } from "@/utils/mail-api/upload-blobs";
 import { clearCachedResearchForUser } from "@/utils/redis/research-cache";
 import {
   DELETE_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR,
@@ -55,6 +58,10 @@ export async function deleteUser({
     DELETE_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR,
   );
 
+  // Drop every session before the slower resource cleanup so a second device
+  // cannot keep calling the API while deletion is in progress.
+  await prisma.session.deleteMany({ where: { userId } });
+
   logger.info("Deleting user resources");
 
   try {
@@ -63,65 +70,79 @@ export async function deleteUser({
       captureException(error);
     });
 
-    deleteTinybirdAiCalls({ userId }).catch((error) => {
-      logger.error("Error deleting Tinybird AI calls", {
-        error,
-        userId,
-      });
-      captureException(error);
-    });
-
     clearCachedResearchForUser(userId).catch((error) => {
       logger.error("Error clearing cached research", { error });
       captureException(error);
     });
 
-    await deleteSoloOrganizations({
-      organizationIds: organizationIdsToDelete,
-      deletedEmailAccountIds: emailAccountIds,
-    });
-
-    const resourcesPromise = accounts.map(async (account) => {
-      if (!account.emailAccount) return Promise.resolve();
-
-      // Create email provider for unwatching
-      const emailProvider = account.access_token
-        ? await createEmailProvider({
-            emailAccountId: account.emailAccount.id,
-            provider: account.provider,
-            logger,
-          })
-        : null;
-
-      return deleteResources({
-        emailAccountId: account.emailAccount.id,
-        email: account.emailAccount.email,
-        userId,
-        emailProvider,
-        subscriptionId: account.emailAccount.watchEmailsSubscriptionId,
-        logger,
-      });
-    });
-
-    // Then proceed with the regular deletion process
-    const results = await Promise.allSettled(resourcesPromise);
-
-    logger.info("User resources deleted");
-
-    // Log any failures
-    const failures = results.filter((r) => r.status === "rejected");
-    if (failures.length > 0) {
-      logger.error("Some deletion operations failed", {
-        failures: failures.map((f) => (f as PromiseRejectedResult).reason),
+    await withThreadPageBufferDeletion(emailAccountIds, async () => {
+      await deleteSoloOrganizations({
+        organizationIds: organizationIdsToDelete,
+        deletedEmailAccountIds: emailAccountIds,
       });
 
-      const originalError = (failures[0] as PromiseRejectedResult)?.reason;
-      const customError = new Error("User deletion error");
-      customError.cause = originalError;
+      const resourcesPromise = accounts.map(async (account) => {
+        if (!account.emailAccount) return Promise.resolve();
 
-      captureException(customError, { extra: { failures } });
-      throw originalError;
-    }
+        let emailProvider: EmailProvider | null = null;
+        if (account.access_token) {
+          try {
+            emailProvider = await createEmailProvider({
+              emailAccountId: account.emailAccount.id,
+              provider: account.provider,
+              logger,
+            });
+          } catch (error) {
+            logger.warn(
+              "Could not create provider to unwatch deleted account",
+              {
+                emailAccountId: account.emailAccount.id,
+                error,
+              },
+            );
+          }
+        }
+
+        return deleteResources({
+          emailAccountId: account.emailAccount.id,
+          email: account.emailAccount.email,
+          userId,
+          emailProvider,
+          subscriptionId: account.emailAccount.watchEmailsSubscriptionId,
+          logger,
+        });
+      });
+
+      // Then proceed with the regular deletion process
+      const results = await Promise.allSettled(resourcesPromise);
+
+      logger.info("User resources deleted");
+
+      // Log any failures
+      const failures = results.filter((r) => r.status === "rejected");
+      if (failures.length > 0) {
+        logger.error("Some deletion operations failed", {
+          failures: failures.map((f) => (f as PromiseRejectedResult).reason),
+        });
+
+        const originalError = (failures[0] as PromiseRejectedResult)?.reason;
+        const customError = new Error("User deletion error");
+        customError.cause = originalError;
+
+        captureException(customError, { extra: { failures } });
+        throw originalError;
+      }
+    });
+
+    const emails = accounts
+      .map((account) => account.emailAccount?.email)
+      .filter((email): email is string => Boolean(email));
+    after(() =>
+      deleteTinybirdEmailData(emails).catch((error) => {
+        logger.error("Error deleting Tinybird data", { error });
+        captureException(error);
+      }),
+    );
   } catch (error) {
     logger.error("Error during user resources deletion process", {
       error,
@@ -186,6 +207,12 @@ async function deleteResources({
 
     // PostHog tracks the completed delete after the database delete succeeds.
     if (deletedUser.count > 0) await trackUserDeleted(userId);
+    await deleteAccountUploadDirectory(emailAccountId).catch((error) => {
+      logger.error("Failed to delete account mail uploads", {
+        error,
+        emailAccountId,
+      });
+    });
   } catch (error) {
     if (
       isOrganizationOwnerInvariantError(error) ||

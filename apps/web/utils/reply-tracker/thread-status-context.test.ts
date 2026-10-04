@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockMessage } from "@/__tests__/helpers";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
-import { buildThreadStatusMessagesForLLM } from "@/utils/reply-tracker/thread-status-context";
+import {
+  buildThreadStatusMessagesForLLM,
+  excludeAssistantMessages,
+} from "@/utils/reply-tracker/thread-status-context";
 
 vi.mock("@/utils/get-email-from-message", () => ({
   getEmailForLLM: vi.fn(),
@@ -34,7 +37,11 @@ describe("buildThreadStatusMessagesForLLM", () => {
     expect(getEmailForLLM).toHaveBeenNthCalledWith(
       1,
       messages[0],
-      expect.objectContaining({ maxLength: 500 }),
+      expect.objectContaining({
+        maxLength: 500,
+        extractReply: true,
+        stripSignature: true,
+      }),
     );
     expect(getEmailForLLM).toHaveBeenNthCalledWith(
       2,
@@ -44,7 +51,12 @@ describe("buildThreadStatusMessagesForLLM", () => {
     expect(getEmailForLLM).toHaveBeenNthCalledWith(
       3,
       messages[2],
-      expect.objectContaining({ maxLength: 2000 }),
+      expect.objectContaining({
+        maxLength: 2000,
+        keepTailLength: 1000,
+        extractReply: true,
+        stripSignature: true,
+      }),
     );
   });
 
@@ -93,7 +105,40 @@ describe("buildThreadStatusMessagesForLLM", () => {
     expect(getEmailForLLM).toHaveBeenNthCalledWith(
       12,
       messages[11],
-      expect.objectContaining({ maxLength: 2000 }),
+      expect.objectContaining({
+        maxLength: 2000,
+        keepTailLength: 1000,
+        stripSignature: true,
+      }),
     );
+  });
+});
+
+describe("excludeAssistantMessages", () => {
+  it("drops filing assistant messages and keeps ordinary ones", () => {
+    const messages = [
+      getMockMessage({ id: "inbound", from: "sender@example.com" }),
+      getMockMessage({
+        id: "user-reply",
+        from: "user@example.com",
+        to: "sender@example.com",
+      }),
+      getMockMessage({
+        id: "filing-notification",
+        from: "user@example.com",
+        to: "user@example.com",
+        subject: "✓ Filed Receipt.pdf",
+      }),
+    ];
+
+    const result = excludeAssistantMessages({
+      messages,
+      userEmail: "user@example.com",
+    });
+
+    expect(result.map((message) => message.id)).toEqual([
+      "inbound",
+      "user-reply",
+    ]);
   });
 });

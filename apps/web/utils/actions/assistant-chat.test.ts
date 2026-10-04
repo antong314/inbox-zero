@@ -26,6 +26,71 @@ describe("confirmAssistantEmailAction", () => {
     vi.useRealTimers();
   });
 
+  it.each([
+    ["send_email", buildPendingSendPart],
+    ["reply_email", buildPendingReplyPart],
+    ["forward_email", buildPendingForwardPart],
+  ] as const)("rejects %s prepared under another mailbox before creating a provider", async (actionType, buildPart) => {
+    const part = buildPart();
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: "chat-message-1",
+      chatId: "chat-1",
+      updatedAt: new Date(),
+      parts: [
+        {
+          ...part,
+          output: { ...part.output, emailAccountId: "original-mailbox" },
+        },
+      ],
+    } as never);
+    prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      confirmAssistantEmailActionForAccount({
+        chatId: "chat-1",
+        chatMessageId: "chat-message-1",
+        toolCallId: part.toolCallId,
+        actionType,
+        emailAccountId: "switched-mailbox",
+        provider: "microsoft",
+        logger: createTestLogger(),
+      }),
+    ).rejects.toThrow("Prepare the draft again");
+    expect(createEmailProvider).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects old drafts without a mailbox binding before creating a provider", async () => {
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: "chat-message-1",
+      chatId: "chat-1",
+      updatedAt: new Date(),
+      parts: [
+        {
+          ...buildPendingSendPart(),
+          output: {
+            ...buildPendingSendPart().output,
+            emailAccountId: undefined,
+          },
+        },
+      ],
+    } as never);
+    prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      confirmAssistantEmailActionForAccount({
+        chatId: "chat-1",
+        chatMessageId: "chat-message-1",
+        toolCallId: "tool-1",
+        actionType: "send_email",
+        emailAccountId: "ea_1",
+        provider: "microsoft",
+        logger: createTestLogger(),
+      }),
+    ).rejects.toThrow("Prepare the draft again");
+    expect(createEmailProvider).not.toHaveBeenCalled();
+  });
+
   it("sends a pending prepared email and persists confirmed output", async () => {
     (prisma.emailAccount.findUnique as any)
       .mockResolvedValueOnce({
@@ -273,7 +338,7 @@ describe("confirmAssistantEmailAction", () => {
       id: "chat-message-1",
       chatId: "chat-1",
       updatedAt: new Date("2026-02-23T00:00:00.000Z"),
-      parts: [buildPendingReplyPart()],
+      parts: [buildPendingReplyPart("Thanks! Reach me at <owner@example.com>")],
     } as any);
 
     prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 } as any);
@@ -307,9 +372,11 @@ describe("confirmAssistantEmailAction", () => {
       } as any,
     );
 
-    expect(replyToEmail).toHaveBeenCalledWith(sourceMessage, "Thanks!", {
-      from: "Owner <owner@example.com>",
-    });
+    expect(replyToEmail).toHaveBeenCalledWith(
+      sourceMessage,
+      "Thanks! Reach me at &lt;owner@example.com&gt;",
+      { from: "Owner <owner@example.com>" },
+    );
     expect(result?.data?.confirmationState).toBe("confirmed");
     expect(result?.data?.confirmationResult).toMatchObject({
       actionType: "reply_email",
@@ -1453,6 +1520,53 @@ describe("confirmAssistantSaveMemory", () => {
     expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
     expect(prisma.chatMemory.create).not.toHaveBeenCalled();
   });
+
+  it("returns the confirmed memory when another request wins the reservation race", async () => {
+    const confirmationResult = {
+      content: "Prefer formal replies with the standard confidential footer.",
+      confirmedAt: "2026-02-23T00:01:00.000Z",
+    };
+
+    prisma.chatMessage.findFirst
+      .mockResolvedValueOnce({
+        id: "chat-message-1",
+        chatId: "chat-1",
+        updatedAt: new Date("2026-02-23T00:00:00.000Z"),
+        parts: [buildPendingSaveMemoryPart()],
+      } as any)
+      .mockResolvedValueOnce({
+        id: "chat-message-1",
+        chatId: "chat-1",
+        updatedAt: new Date("2026-02-23T00:01:00.000Z"),
+        parts: [
+          {
+            ...buildPendingSaveMemoryPart(),
+            output: {
+              ...buildPendingSaveMemoryPart().output,
+              confirmationState: "confirmed",
+              confirmationResult,
+            },
+          },
+        ],
+      } as any);
+    prisma.chatMessage.updateMany.mockResolvedValue({ count: 0 } as any);
+
+    const result = await confirmAssistantSaveMemoryForAccount({
+      chatId: "chat-1",
+      chatMessageId: "chat-message-1",
+      toolCallId: "tool-1",
+      emailAccountId: "ea_1",
+      logger: createTestLogger(),
+    });
+
+    expect(result).toMatchObject({
+      confirmationState: "confirmed",
+      confirmationResult,
+    });
+    expect(prisma.chatMessage.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.chatMemory.findFirst).not.toHaveBeenCalled();
+    expect(prisma.chatMemory.create).not.toHaveBeenCalled();
+  });
 });
 
 function buildPendingSendPart() {
@@ -1465,6 +1579,7 @@ function buildPendingSendPart() {
       actionType: "send_email",
       requiresConfirmation: true,
       confirmationState: "pending",
+      emailAccountId: "ea_1",
       pendingAction: {
         to: "recipient@example.com",
         cc: null,
@@ -1534,7 +1649,7 @@ function confirmPendingSendEmail() {
   );
 }
 
-function buildPendingReplyPart() {
+function buildPendingReplyPart(content = "Thanks!") {
   return {
     type: "tool-replyEmail",
     toolCallId: "tool-1",
@@ -1544,9 +1659,10 @@ function buildPendingReplyPart() {
       actionType: "reply_email",
       requiresConfirmation: true,
       confirmationState: "pending",
+      emailAccountId: "ea_1",
       pendingAction: {
         messageId: "source-message-1",
-        content: "Thanks!",
+        content,
       },
       reference: {
         messageId: "source-message-1",
@@ -1568,6 +1684,7 @@ function buildPendingForwardPart() {
       actionType: "forward_email",
       requiresConfirmation: true,
       confirmationState: "pending",
+      emailAccountId: "ea_1",
       pendingAction: {
         messageId: "source-message-1",
         to: "recipient@example.com",

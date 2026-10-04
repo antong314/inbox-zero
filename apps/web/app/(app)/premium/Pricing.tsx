@@ -9,6 +9,10 @@ import { usePostHog } from "posthog-js/react";
 import { env } from "@/env";
 import { LoadingContent } from "@/components/LoadingContent";
 import { usePremium } from "@/hooks/usePremium";
+import {
+  usePricingFrequencyDefault,
+  type PricingFrequencyDefault,
+} from "@/hooks/useFeatureFlags";
 import { Button } from "@/components/ui/button";
 import {
   PricingFrequencyToggle,
@@ -36,17 +40,20 @@ import { cn } from "@/utils";
 import { ManageSubscription } from "@/app/(app)/premium/ManageSubscription";
 import { captureException } from "@/utils/error";
 import { redirectToSafeUrl } from "@/utils/redirect";
+import type { CheckoutReturnTo } from "@/utils/actions/premium.validation";
 
 export type PricingProps = {
   header?: React.ReactNode;
   showSkipUpgrade?: boolean;
   className?: string;
   displayTiers?: Tier[];
+  checkoutReturnTo?: CheckoutReturnTo;
 };
 
 export default function Pricing(props: PricingProps) {
   const posthog = usePostHog();
-  const { premium, isPremium, isLoading, error, data } = usePremium();
+  const { premium, isPremium, isLoading, error, data, canManageBilling } =
+    usePremium();
   const hasTrackedPricingView = useRef(false);
 
   const isLoggedIn = !!data?.id;
@@ -67,7 +74,15 @@ export default function Pricing(props: PricingProps) {
   );
   const isLegacyStripePlan = shouldShowLegacyStripePricingNotice(premium);
 
-  const [frequency, setFrequency] = useState(frequencies[1]);
+  const pricingFrequencyDefaultVariant = usePricingFrequencyDefault();
+  const defaultFrequency =
+    pricingFrequencyDefaultVariant === "annually"
+      ? frequencies[1]
+      : frequencies[0];
+  const [chosenFrequency, setFrequency] = useState<
+    (typeof frequencies)[number] | null
+  >(null);
+  const frequency = chosenFrequency ?? defaultFrequency;
 
   const userPremiumTier = getUserTier(premium);
 
@@ -90,7 +105,13 @@ export default function Pricing(props: PricingProps) {
   const router = useRouter();
 
   useEffect(() => {
-    if (isLoading || hasTrackedPricingView.current) return;
+    if (
+      isLoading ||
+      pricingFrequencyDefaultVariant === undefined ||
+      hasTrackedPricingView.current
+    ) {
+      return;
+    }
 
     hasTrackedPricingView.current = true;
     posthog.capture("pricing_page_viewed", {
@@ -99,23 +120,43 @@ export default function Pricing(props: PricingProps) {
       hasExistingSubscription,
       showSkipUpgrade: Boolean(props.showSkipUpgrade),
       displayedTiers: displayedTiers.map((tier) => tier.name),
+      frequency: frequency.value,
+      defaultFrequency: defaultFrequency.value,
+      frequencySource: chosenFrequency ? "user_selected" : "default",
+      pricingFrequencyDefaultVariant,
     });
   }, [
+    chosenFrequency,
+    defaultFrequency.value,
     displayedTiers,
+    frequency.value,
     hasExistingSubscription,
     isLoading,
     isLoggedIn,
     posthog,
+    pricingFrequencyDefaultVariant,
     pricingSource,
     props.showSkipUpgrade,
   ]);
+
+  if (isLoggedIn && !canManageBilling) {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-12">
+        <AlertBasic
+          variant="blue"
+          title="Billing access restricted"
+          description="Only organization owners and admins can manage billing."
+        />
+      </div>
+    );
+  }
 
   return (
     <LoadingContent loading={isLoading} error={error}>
       <div
         id="pricing"
         className={cn(
-          "relative isolate mx-auto max-w-7xl bg-white px-6 pt-10 lg:px-8",
+          "relative isolate mx-auto max-w-7xl bg-white px-6 pt-6 sm:pt-10 lg:px-8",
           props.className,
         )}
       >
@@ -158,7 +199,17 @@ export default function Pricing(props: PricingProps) {
 
         <PricingFrequencyToggle
           frequency={frequency}
-          setFrequency={setFrequency}
+          setFrequency={(nextFrequency) => {
+            posthog.capture("pricing_frequency_changed", {
+              source: pricingSource,
+              previousFrequency: frequency.value,
+              frequency: nextFrequency.value,
+              defaultFrequency: defaultFrequency.value,
+              pricingFrequencyDefaultVariant:
+                pricingFrequencyDefaultVariant ?? null,
+            });
+            setFrequency(nextFrequency);
+          }}
         >
           <div className="ml-1">
             <DiscountBadge>Save up to 20%</DiscountBadge>
@@ -167,7 +218,7 @@ export default function Pricing(props: PricingProps) {
 
         <div
           className={cn(
-            "isolate mx-auto mt-10 grid grid-cols-1 gap-y-8 gap-4",
+            "isolate mx-auto mt-6 grid grid-cols-1 gap-y-8 gap-4 sm:mt-10",
             displayedTiers.length === 2
               ? "max-w-3xl lg:grid-cols-2"
               : "max-w-7xl lg:mx-0 lg:max-w-none lg:grid-cols-3",
@@ -179,6 +230,11 @@ export default function Pricing(props: PricingProps) {
               tier={tier}
               userPremiumTier={userPremiumTier}
               frequency={frequency}
+              defaultFrequency={defaultFrequency}
+              frequencySource={chosenFrequency ? "user_selected" : "default"}
+              pricingFrequencyDefaultVariant={
+                pricingFrequencyDefaultVariant ?? null
+              }
               stripeSubscriptionId={premium?.stripeSubscriptionId}
               stripeSubscriptionStatus={premium?.stripeSubscriptionStatus}
               hasActiveAppleManagedSubscription={
@@ -188,6 +244,7 @@ export default function Pricing(props: PricingProps) {
               router={router}
               userId={data?.id}
               pricingSource={pricingSource}
+              checkoutReturnTo={props.checkoutReturnTo}
             />
           ))}
         </div>
@@ -200,6 +257,9 @@ function PriceTier({
   tier,
   userPremiumTier,
   frequency,
+  defaultFrequency,
+  frequencySource,
+  pricingFrequencyDefaultVariant,
   stripeSubscriptionId,
   stripeSubscriptionStatus,
   hasActiveAppleManagedSubscription,
@@ -207,10 +267,14 @@ function PriceTier({
   router,
   userId,
   pricingSource,
+  checkoutReturnTo,
 }: {
   tier: Tier;
   userPremiumTier: PremiumTier | null;
   frequency: Frequency;
+  defaultFrequency: Frequency;
+  frequencySource: "default" | "user_selected";
+  pricingFrequencyDefaultVariant: PricingFrequencyDefault | null;
   stripeSubscriptionId: string | null | undefined;
   stripeSubscriptionStatus: string | null | undefined;
   hasActiveAppleManagedSubscription: boolean;
@@ -218,6 +282,7 @@ function PriceTier({
   router: ReturnType<typeof useRouter>;
   userId: string | null | undefined;
   pricingSource: "welcome_upgrade" | "app_premium";
+  checkoutReturnTo?: CheckoutReturnTo;
 }) {
   const posthog = usePostHog();
   const [loading, setLoading] = useState(false);
@@ -235,10 +300,7 @@ function PriceTier({
   }
 
   return (
-    <ThreeColItem
-      key={tier.name}
-      className="flex flex-col rounded-3xl bg-white p-8 ring-1 ring-gray-200 xl:p-10"
-    >
+    <div className="flex flex-col rounded-3xl bg-white p-6 ring-1 ring-gray-200 sm:p-8 xl:p-10">
       <div className="flex-1">
         <div className="flex items-center justify-between gap-x-4">
           <h3
@@ -313,6 +375,9 @@ function PriceTier({
             tier: tier.name,
             billingTier: upgradeToTier ?? null,
             frequency: frequency.value,
+            defaultFrequency: defaultFrequency.value,
+            frequencySource,
+            pricingFrequencyDefaultVariant,
             cta: getCTAText(),
             isCurrentPlan,
             isLoggedIn,
@@ -352,20 +417,20 @@ function PriceTier({
 
             if (hasActiveStripeSubscription) {
               result = await getBillingPortalUrlAction({ tier: upgradeToTier });
-
-              if (!result?.data?.url) {
-                result = await generateCheckoutSessionAction({
-                  tier: upgradeToTier,
-                });
-              }
             } else {
               result = await generateCheckoutSessionAction({
                 tier: upgradeToTier,
+                returnTo: checkoutReturnTo,
               });
             }
 
             if (!result?.data?.url || result?.serverError) {
-              captureException(new Error("Error creating checkout session"), {
+              const description = hasActiveStripeSubscription
+                ? `We couldn't open the plan change page. Your subscription has not been changed. Please contact support at ${env.NEXT_PUBLIC_SUPPORT_EMAIL}`
+                : result?.serverError ||
+                  `Error creating checkout session. Please contact support at ${env.NEXT_PUBLIC_SUPPORT_EMAIL}`;
+
+              captureException(new Error("Error opening Stripe billing flow"), {
                 extra: {
                   tier: upgradeToTier,
                   frequency: frequency.value,
@@ -375,9 +440,7 @@ function PriceTier({
                 },
               });
               toastError({
-                description:
-                  result?.serverError ||
-                  `Error creating checkout session. Please contact support at ${env.NEXT_PUBLIC_SUPPORT_EMAIL}`,
+                description,
               });
               return;
             }
@@ -415,16 +478,6 @@ function PriceTier({
           getCTAText()
         )}
       </button>
-    </ThreeColItem>
+    </div>
   );
-}
-
-function ThreeColItem({
-  children,
-  className,
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return <div className={cn(className)}>{children}</div>;
 }

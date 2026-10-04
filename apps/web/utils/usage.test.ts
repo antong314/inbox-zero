@@ -13,7 +13,48 @@ vi.mock("@/utils/redis/usage", () => ({
   saveUsage: vi.fn().mockResolvedValue(undefined),
 }));
 
+function languageModelUsage({
+  inputTokens,
+  outputTokens,
+  totalTokens,
+  cachedInputTokens,
+  reasoningTokens,
+}: {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+}): LanguageModelUsage {
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    inputTokenDetails: {
+      noCacheTokens: undefined,
+      cacheReadTokens: cachedInputTokens,
+      cacheWriteTokens: undefined,
+    },
+    outputTokenDetails: {
+      textTokens: undefined,
+      reasoningTokens,
+    },
+  };
+}
+
 describe("calculateUsageCost", () => {
+  it("prices decision-model calls by input tokens only", () => {
+    const usage = languageModelUsage({
+      inputTokens: 1_000_000_000,
+      outputTokens: 5,
+      totalTokens: 1_000_000_005,
+    });
+
+    expect(
+      calculateUsageCost({ provider: "typesafe", model: "jev-latest", usage }),
+    ).toBeCloseTo(42);
+  });
+
   it("applies cached input pricing when cached tokens are present", () => {
     const provider = "openrouter";
     const model = "openai/gpt-5.1";
@@ -22,22 +63,23 @@ describe("calculateUsageCost", () => {
     expect(pricing).toBeDefined();
     if (!pricing) throw new Error("Expected pricing for gpt-5.1");
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       cachedInputTokens: 400,
       outputTokens: 200,
       totalTokens: 1200,
-    };
+    });
 
     const expected =
-      (usage.inputTokens! - usage.cachedInputTokens!) * pricing.input +
-      usage.cachedInputTokens! * pricing.cachedInput +
+      (usage.inputTokens! - usage.inputTokenDetails.cacheReadTokens!) *
+        pricing.input +
+      usage.inputTokenDetails.cacheReadTokens! * pricing.cachedInput +
       usage.outputTokens! * pricing.output;
 
     expect(calculateUsageCost({ provider, model, usage })).toBe(expected);
   });
 
-  it("charges reasoning tokens at the output rate", () => {
+  it("does not charge reasoning tokens twice when output includes them", () => {
     const provider = "openrouter";
     const model = "openai/gpt-5.1";
     const pricing = OPENROUTER_MODEL_PRICING["gpt-5.1"];
@@ -45,16 +87,15 @@ describe("calculateUsageCost", () => {
     expect(pricing).toBeDefined();
     if (!pricing) throw new Error("Expected pricing for gpt-5.1");
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 200,
       reasoningTokens: 50,
       totalTokens: 1200,
-    };
+    });
 
     const expected =
-      usage.inputTokens! * pricing.input +
-      (usage.outputTokens! + usage.reasoningTokens!) * pricing.output;
+      usage.inputTokens! * pricing.input + usage.outputTokens! * pricing.output;
 
     expect(calculateUsageCost({ provider, model, usage })).toBe(expected);
   });
@@ -62,11 +103,11 @@ describe("calculateUsageCost", () => {
   it("uses fallback pricing first for non-openrouter providers", () => {
     const provider = "openai";
     const model = "gpt-4o";
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 100,
       outputTokens: 50,
       totalTokens: 150,
-    };
+    });
 
     // Fallback map values in supported-model-pricing.ts for gpt-4o
     const expected =
@@ -83,16 +124,17 @@ describe("calculateUsageCost", () => {
     const pricing = OPENROUTER_MODEL_PRICING[baseModel];
     if (!pricing) throw new Error("Expected pricing for gpt-5.1");
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 500,
       cachedInputTokens: 100,
       outputTokens: 75,
       totalTokens: 575,
-    };
+    });
 
     const expected =
-      (usage.inputTokens! - usage.cachedInputTokens!) * pricing.input +
-      usage.cachedInputTokens! * pricing.cachedInput +
+      (usage.inputTokens! - usage.inputTokenDetails.cacheReadTokens!) *
+        pricing.input +
+      usage.inputTokenDetails.cacheReadTokens! * pricing.cachedInput +
       usage.outputTokens! * pricing.output;
 
     expect(calculateUsageCost({ provider, model, usage })).toBe(expected);
@@ -104,12 +146,12 @@ describe("calculateUsageCost", () => {
     const pricing = OPENROUTER_MODEL_PRICING["gpt-5.1"];
     if (!pricing) throw new Error("Expected pricing for gpt-5.1");
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 100,
       cachedInputTokens: 300,
       outputTokens: 20,
       totalTokens: 120,
-    };
+    });
 
     const expected = 100 * pricing.cachedInput + 20 * pricing.output;
 
@@ -122,25 +164,25 @@ describe("calculateUsageCost", () => {
     const pricing = OPENROUTER_MODEL_PRICING["gpt-5.1"];
     if (!pricing) throw new Error("Expected pricing for gpt-5.1");
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       cachedInputTokens: 120,
       outputTokens: 30,
       totalTokens: 150,
-    };
+    });
 
     const expected =
-      usage.cachedInputTokens! * pricing.cachedInput +
+      usage.inputTokenDetails.cacheReadTokens! * pricing.cachedInput +
       usage.outputTokens! * pricing.output;
 
     expect(calculateUsageCost({ provider, model, usage })).toBe(expected);
   });
 
   it("returns zero when pricing is unavailable", () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 100,
       outputTokens: 50,
       totalTokens: 150,
-    };
+    });
 
     expect(
       calculateUsageCost({
@@ -151,18 +193,20 @@ describe("calculateUsageCost", () => {
     ).toBe(0);
   });
 
-  it("estimates DeepSeek V4 Flash costs", () => {
+  it.each([
+    "deepseek/deepseek-v4-flash",
+    "~deepseek/deepseek-v4-flash-latest",
+  ])("estimates DeepSeek V4 Flash costs for %s", (model) => {
     const provider = "openrouter";
-    const model = "deepseek/deepseek-v4-flash";
     const pricing = OPENROUTER_MODEL_PRICING[model];
-    if (!pricing) throw new Error("Expected pricing for deepseek-v4-flash");
+    if (!pricing) throw new Error(`Expected pricing for ${model}`);
 
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       cachedInputTokens: 250,
       outputTokens: 500,
       totalTokens: 1500,
-    };
+    });
 
     const expected =
       750 * pricing.input + 250 * pricing.cachedInput + 500 * pricing.output;
@@ -171,12 +215,12 @@ describe("calculateUsageCost", () => {
   });
 
   it("estimates current platform model costs", () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       cachedInputTokens: 250,
       outputTokens: 500,
       totalTokens: 1500,
-    };
+    });
 
     expect(
       calculateUsageCost({
@@ -188,6 +232,18 @@ describe("calculateUsageCost", () => {
       750 * (1.925 / 1_000_000) +
         250 * (0.165 / 1_000_000) +
         500 * (3.828 / 1_000_000),
+    );
+
+    expect(
+      calculateUsageCost({
+        provider: "azure-foundry",
+        model: "DeepSeek-V4-Flash",
+        usage,
+      }),
+    ).toBeCloseTo(
+      750 * (0.19 / 1_000_000) +
+        250 * (0.028 / 1_000_000) +
+        500 * (0.51 / 1_000_000),
     );
 
     expect(
@@ -212,11 +268,11 @@ describe("calculateUsageCost", () => {
   });
 
   it("resolves prefixed OpenRouter pricing for non-prefixed model names", () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 100,
       outputTokens: 50,
       totalTokens: 150,
-    };
+    });
 
     const pricing = OPENROUTER_MODEL_PRICING["anthropic/claude-sonnet-4.5"];
     if (!pricing)
@@ -241,13 +297,13 @@ describe("saveAiUsage", () => {
   });
 
   it("publishes cached and reasoning token counts to analytics", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 700,
       cachedInputTokens: 300,
       outputTokens: 150,
       reasoningTokens: 25,
       totalTokens: 850,
-    };
+    });
 
     await saveAiUsage({
       userId: "user-1",
@@ -291,11 +347,11 @@ describe("saveAiUsage", () => {
   });
 
   it("sets platform cost to zero for user API key traffic", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       totalTokens: 1400,
-    };
+    });
 
     const estimatedCost = calculateUsageCost({
       provider: "openrouter",
@@ -334,13 +390,43 @@ describe("saveAiUsage", () => {
     );
   });
 
+  it("records Redis usage when analytics ingestion throws synchronously", async () => {
+    vi.mocked(publishAiCall).mockImplementationOnce(() => {
+      throw new Error("analytics unavailable");
+    });
+
+    const usage = languageModelUsage({
+      inputTokens: 1000,
+      outputTokens: 400,
+      totalTokens: 1400,
+    });
+
+    await saveAiUsage({
+      userId: "user-1",
+      email: "user@example.com",
+      emailAccountId: "email-account-1",
+      provider: "azure-foundry",
+      model: "DeepSeek-V4-Pro",
+      usage,
+      label: "Choose rule",
+    });
+
+    expect(saveUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "user-1",
+        emailAccountId: "email-account-1",
+        usage,
+      }),
+    );
+  });
+
   it("uses provider-reported cost for platform spend", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       reasoningTokens: 200,
       totalTokens: 1400,
-    };
+    });
 
     const estimatedCost = calculateUsageCost({
       provider: "openrouter",
@@ -387,13 +473,13 @@ describe("saveAiUsage", () => {
 
   it("logs completed AI calls with usage and provider request metadata", async () => {
     const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       cachedInputTokens: 200,
       outputTokens: 400,
       reasoningTokens: 100,
       totalTokens: 1500,
-    };
+    });
 
     await saveAiUsage({
       userId: "user-1",
@@ -425,11 +511,11 @@ describe("saveAiUsage", () => {
   });
 
   it("uses estimated cost when provider-reported cost is zero", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       totalTokens: 1400,
-    };
+    });
     const estimatedCost = calculateUsageCost({
       provider: "openrouter",
       model: "openai/gpt-5.1",
@@ -469,11 +555,11 @@ describe("saveAiUsage", () => {
   });
 
   it("keeps zero provider-reported cost when pricing is unavailable", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       totalTokens: 1400,
-    };
+    });
 
     await saveAiUsage({
       userId: "user-1",
@@ -506,11 +592,11 @@ describe("saveAiUsage", () => {
   });
 
   it("uses upstream inference cost when provider cost is unavailable", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       totalTokens: 1400,
-    };
+    });
 
     await saveAiUsage({
       userId: "user-1",
@@ -543,14 +629,14 @@ describe("saveAiUsage", () => {
   });
 
   it("notifies usage listeners with estimated and provider-reported costs", async () => {
-    const usage: LanguageModelUsage = {
+    const usage = languageModelUsage({
       inputTokens: 1000,
       outputTokens: 400,
       totalTokens: 1400,
-    };
+    });
     const estimatedCost = calculateUsageCost({
       provider: "openrouter",
-      model: "deepseek/deepseek-v4-flash",
+      model: "~deepseek/deepseek-v4-flash-latest",
       usage,
     });
     const listener = vi.fn();
@@ -562,7 +648,7 @@ describe("saveAiUsage", () => {
         email: "user@example.com",
         emailAccountId: "email-account-1",
         provider: "openrouter",
-        model: "deepseek/deepseek-v4-flash",
+        model: "~deepseek/deepseek-v4-flash-latest",
         usage,
         label: "eval-test",
         providerReportedCost: 0.000_18,
@@ -574,7 +660,7 @@ describe("saveAiUsage", () => {
     expect(listener).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: "openrouter",
-        model: "deepseek/deepseek-v4-flash",
+        model: "~deepseek/deepseek-v4-flash-latest",
         label: "eval-test",
         estimatedCost,
         platformCost: 0.000_18,

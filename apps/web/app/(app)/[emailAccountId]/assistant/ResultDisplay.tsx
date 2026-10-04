@@ -18,12 +18,7 @@ import { useRuleDialog } from "@/app/(app)/[emailAccountId]/assistant/RuleDialog
 import { ThreadSkipHint } from "@/app/(app)/[emailAccountId]/assistant/ThreadSkipHint";
 import { LearnedPatternExclusionHint } from "@/app/(app)/[emailAccountId]/assistant/LearnedPatternExclusionHint";
 import type { RunRulesResult } from "@/utils/ai/choose-rule/run-rules";
-import {
-  getActionDisplay,
-  getActionIcon,
-  getVisibleActions,
-} from "@/utils/action-display";
-import { getActionColor } from "@/components/PlanBadge";
+import { RuleActions } from "@/components/RuleActions";
 import { useAccount } from "@/providers/EmailAccountProvider";
 
 export function ResultsDisplay({
@@ -146,7 +141,7 @@ export function ResultDisplayContent({ result }: { result: RunRulesResult }) {
         {result.actionItems?.length ? (
           <>
             <div className="font-medium text-sm mb-1">Actions:</div>
-            <Actions
+            <RuleActions
               actions={
                 result.actionItems?.map((action) => ({
                   id: action.id,
@@ -215,69 +210,6 @@ export function ResultDisplayContent({ result }: { result: RunRulesResult }) {
   );
 }
 
-function Actions({
-  actions,
-  provider,
-  labels,
-}: {
-  actions: {
-    id: string;
-    type: ActionType;
-    label?: string | null;
-    labelId?: string | null;
-    folderName?: string | null;
-    content?: string | null;
-    to?: string | null;
-    subject?: string | null;
-    cc?: string | null;
-    bcc?: string | null;
-    url?: string | null;
-  }[];
-  provider: string;
-  labels: Array<{ id: string; name: string }>;
-}) {
-  return (
-    <div className="flex flex-col gap-2 flex-wrap">
-      {getVisibleActions(actions).map((action) => {
-        const Icon = getActionIcon(action.type);
-        const fields = [
-          { key: "to", value: action.to },
-          { key: "cc", value: action.cc },
-          { key: "bcc", value: action.bcc },
-          { key: "subject", value: action.subject },
-          { key: "content", value: action.content },
-          { key: "url", value: action.url },
-        ].filter((field) => field.value);
-
-        return (
-          <div key={action.id} className="flex flex-col gap-1">
-            <Badge
-              color={getActionColor(action.type)}
-              className="w-fit text-nowrap"
-            >
-              <Icon className="size-3 mr-1.5" />
-              {getActionDisplay(action, provider, labels)}
-            </Badge>
-            {fields.length > 0 && (
-              <div className="ml-1 space-y-0.5 text-sm text-muted-foreground">
-                {fields.map((field) => (
-                  <div
-                    key={field.key}
-                    className="whitespace-pre-wrap break-all"
-                  >
-                    <span className="font-medium capitalize">{field.key}:</span>{" "}
-                    {field.value}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function PrettyConditions({
   rule,
 }: {
@@ -286,7 +218,7 @@ function PrettyConditions({
     "from" | "to" | "subject" | "body" | "instructions" | "conditionalOperator"
   >;
 }) {
-  const conditions: string[] = [];
+  const conditions: { text: string; isInstructions?: boolean }[] = [];
 
   // Static conditions - grouped with commas
   const staticConditions: string[] = [];
@@ -294,10 +226,11 @@ function PrettyConditions({
   if (rule.subject) staticConditions.push(`Subject: "${rule.subject}"`);
   if (rule.to) staticConditions.push(`To: ${rule.to}`);
   if (rule.body) staticConditions.push(`Body: "${rule.body}"`);
-  if (staticConditions.length) conditions.push(staticConditions.join(", "));
+  if (staticConditions.length)
+    conditions.push({ text: staticConditions.join(", ") });
 
-  // AI condition
-  if (rule.instructions) conditions.push(rule.instructions);
+  if (rule.instructions)
+    conditions.push({ text: rule.instructions, isInstructions: true });
 
   const operator =
     rule.conditionalOperator === LogicalOperator.AND ? "AND" : "OR";
@@ -305,8 +238,16 @@ function PrettyConditions({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {conditions.map((condition, index) => (
-        <div key={index} className="flex items-center gap-1.5">
-          <MutedText>{condition}</MutedText>
+        <div key={index} className="flex min-w-0 items-center gap-1.5">
+          <MutedText
+            className={
+              condition.isInstructions
+                ? "line-clamp-2 whitespace-pre-line break-words"
+                : undefined
+            }
+          >
+            {condition.text}
+          </MutedText>
           {index < conditions.length - 1 && (
             <Badge color="purple" className="text-xs">
               {operator}
@@ -456,10 +397,27 @@ const ACTION_FAILURE_MESSAGES: Partial<
       SEND_FAILED: "The sender notification could not be sent.",
     },
   },
+  // Only the action type and error code survive in the stored reason, so this
+  // copy stays integration-neutral. The executor records a message naming the
+  // integration alongside it.
+  [ActionType.INTEGRATION]: {
+    fallback: "The integration action could not be completed.",
+    codes: {
+      INTEGRATION_NOT_CONNECTED:
+        "The integration isn't connected. Connect it on the Integrations page.",
+      MISSING_INTEGRATION_ARGS:
+        "The integration action could not run because a required field was empty.",
+      INTEGRATION_CALL_FAILED: "The integration action could not be completed.",
+    },
+  },
 };
 
 function getActionFailureMessage(actionType: string, errorCode: string) {
-  const entry = ACTION_FAILURE_MESSAGES[actionType as ActionType];
+  const entry = Object.hasOwn(ACTION_FAILURE_MESSAGES, actionType)
+    ? ACTION_FAILURE_MESSAGES[actionType as ActionType]
+    : undefined;
   if (!entry) return "An action could not be completed.";
-  return entry.codes[errorCode] ?? entry.fallback;
+  return Object.hasOwn(entry.codes, errorCode)
+    ? entry.codes[errorCode]
+    : entry.fallback;
 }

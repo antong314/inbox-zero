@@ -16,10 +16,28 @@ const getRuleExecutionForMessageInputSchema = z.object({
     ),
 });
 
+type RuleExecutionEvidence =
+  | {
+      state: "NO_EXECUTION_RECORDS";
+      rootCauseKnown: false;
+      summary: string;
+    }
+  | {
+      state: "INCONCLUSIVE_SKIPPED_RECORDS";
+      rootCauseKnown: false;
+      summary: string;
+    }
+  | {
+      state: "RECORDED_EXECUTIONS";
+      rootCauseKnown: null;
+      summary: string;
+    };
+
 type GetRuleExecutionForMessageOutput =
   | {
       messageId: string;
       threadId: string | null;
+      evidence: RuleExecutionEvidence;
       executions: Array<{
         executedRuleId: string;
         ruleId: string | null;
@@ -56,14 +74,13 @@ export const getRuleExecutionForMessageTool = ({
   emailAccountId: string;
   logger: Logger;
 }) =>
-  tool<
-    z.infer<typeof getRuleExecutionForMessageInputSchema>,
-    GetRuleExecutionForMessageOutput
-  >({
+  tool({
     description:
-      "Fetch the recorded rule executions for a specific processed email by message ID. Returns the executions for that message, including status, matched rule, reason, and the actions that were taken such as drafting, labeling, archiving, or forwarding. Use this when the user is asking what happened to a particular email, why it was processed a certain way, or whether multiple rules matched.",
+      "Fetch the recorded rule executions for a specific processed email by message ID. Returns an evidence summary plus executions for that message, including status, matched rule, reason, and actions such as drafting, labeling, archiving, or forwarding. Use this when the user asks what happened to a particular email, why it was processed a certain way, or whether multiple rules matched. When rootCauseKnown is false, say the cause cannot be determined from the available evidence; do not infer even a likely cause from rule configuration or message content.",
     inputSchema: getRuleExecutionForMessageInputSchema,
-    execute: async ({ messageId }) => {
+    execute: async ({
+      messageId,
+    }): Promise<GetRuleExecutionForMessageOutput> => {
       trackRuleToolCall({
         tool: "get_rule_execution_for_message",
         email,
@@ -135,6 +152,7 @@ export const getRuleExecutionForMessageTool = ({
         return {
           messageId,
           threadId: executedRules[0]?.threadId ?? null,
+          evidence: getExecutionEvidence(executions),
           executions,
         };
       } catch (error) {
@@ -153,3 +171,51 @@ export const getRuleExecutionForMessageTool = ({
 export type GetRuleExecutionForMessageTool = InferUITool<
   ReturnType<typeof getRuleExecutionForMessageTool>
 >;
+
+function getExecutionEvidence(
+  executions: Array<{
+    ruleId: string | null;
+    status: ExecutedRuleStatus;
+    matchMetadata: unknown;
+    actions: unknown[];
+  }>,
+): RuleExecutionEvidence {
+  if (executions.length === 0) {
+    return {
+      state: "NO_EXECUTION_RECORDS",
+      rootCauseKnown: false,
+      summary:
+        "No execution records were found. This is missing evidence, not proof that processing never ran or of why a rule did not match.",
+    };
+  }
+
+  if (executions.every(isInconclusiveSkippedExecution)) {
+    return {
+      state: "INCONCLUSIVE_SKIPPED_RECORDS",
+      rootCauseKnown: false,
+      summary:
+        "Only inconclusive skipped execution records were found. They do not establish whether a specific rule matched, was later deleted, or why processing was skipped.",
+    };
+  }
+
+  return {
+    state: "RECORDED_EXECUTIONS",
+    rootCauseKnown: null,
+    summary:
+      "Recorded rule executions are available. Use each execution's rule, status, reason, match metadata, and actions to explain only what those records establish.",
+  };
+}
+
+function isInconclusiveSkippedExecution(execution: {
+  ruleId: string | null;
+  status: ExecutedRuleStatus;
+  matchMetadata: unknown;
+  actions: unknown[];
+}) {
+  return (
+    execution.ruleId === null &&
+    execution.status === "SKIPPED" &&
+    execution.matchMetadata === null &&
+    execution.actions.length === 0
+  );
+}

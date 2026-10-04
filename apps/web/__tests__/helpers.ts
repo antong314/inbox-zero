@@ -21,6 +21,7 @@ type TestRequestWithLogger = Request & {
 
 type TestAuth = {
   userId: string;
+  emailOtp?: boolean;
 };
 
 type TestEmailAccountAuth = {
@@ -95,6 +96,28 @@ export function createWithEmailAccountTestMiddleware(
       scopeOrHandler: string | TestMiddlewareHandler,
       handler?: TestMiddlewareHandler,
     ) => wrap(typeof scopeOrHandler === "string" ? handler! : scopeOrHandler),
+  };
+}
+
+export function createWithEmailProviderTestMiddleware(
+  emailProvider: unknown,
+  options?: Parameters<typeof addTestEmailAccountAuth>[1] &
+    TestSafeErrorOptions,
+) {
+  const { withEmailAccount } = createWithEmailAccountTestMiddleware(options);
+
+  return {
+    withEmailProvider: (
+      scopeOrHandler: string | TestMiddlewareHandler,
+      handler?: TestMiddlewareHandler,
+    ) => {
+      const wrapped =
+        typeof scopeOrHandler === "string" ? handler! : scopeOrHandler;
+
+      return withEmailAccount((request, ...context) =>
+        wrapped(Object.assign(request, { emailProvider }), ...context),
+      );
+    },
   };
 }
 
@@ -492,5 +515,32 @@ export function getCalendarConnection({
     createdAt: new Date(),
     updatedAt: new Date(),
     calendars: calendarIds.map((id) => ({ calendarId: id })),
+  };
+}
+
+export function getMockOrganizationMembership({
+  role,
+  ownerUserId = "org-owner",
+  ownerPremiumId = null,
+}: {
+  role: string;
+  ownerUserId?: string;
+  ownerPremiumId?: string | null;
+}) {
+  return {
+    role,
+    organization: {
+      members: [
+        {
+          emailAccount: {
+            user: {
+              id: ownerUserId,
+              premiumId: ownerPremiumId,
+              premiumAdminId: null,
+            },
+          },
+        },
+      ],
+    },
   };
 }

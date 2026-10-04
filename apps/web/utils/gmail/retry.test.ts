@@ -4,6 +4,7 @@ import {
   isRetryableError,
   calculateRetryDelay,
   withGmailRetry,
+  withGmailNonIdempotentWriteRetry,
   MAX_GMAIL_BLOCKING_RETRY_DELAY_MS,
 } from "./retry";
 import { sleep } from "@/utils/sleep";
@@ -186,15 +187,6 @@ describe("Gmail retry helpers", () => {
       expect(delay).toBe(1000);
     });
 
-    it("should use fallback delay when Retry-After header is stale", () => {
-      // Use HTTP-date format (like "Wed, 21 Oct 2015 07:28:00 GMT")
-      const pastDate = new Date(Date.now() - 5000).toUTCString();
-
-      // Should fall back to exponential backoff for server error
-      const delay = calculateRetryDelay(false, true, false, 2, pastDate);
-      expect(delay).toBe(10_000); // 2nd attempt = 10s
-    });
-
     it("should use retry time from error message when valid", () => {
       const futureDate = new Date(Date.now() + 15_000).toISOString();
       const errorMessage = `Rate limit exceeded. Retry after ${futureDate}`;
@@ -317,6 +309,35 @@ describe("Gmail retry helpers", () => {
 
       expect(operation).toHaveBeenCalledTimes(1);
       expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("withGmailNonIdempotentWriteRetry", () => {
+    it("retries an explicit throttle rejection", async () => {
+      const error = Object.assign(new Error("rate limit exceeded"), {
+        status: 429,
+      });
+      const operation = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue("sent");
+
+      await expect(
+        withGmailNonIdempotentWriteRetry(operation, 1),
+      ).resolves.toBe("sent");
+      expect(operation).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      Object.assign(new Error("service unavailable"), { status: 503 }),
+      Object.assign(new Error("fetch failed"), { code: "ECONNRESET" }),
+    ])("does not retry an ambiguous failure", async (error) => {
+      const operation = vi.fn().mockRejectedValue(error);
+
+      await expect(withGmailNonIdempotentWriteRetry(operation, 5)).rejects.toBe(
+        error,
+      );
+      expect(operation).toHaveBeenCalledOnce();
     });
   });
 });

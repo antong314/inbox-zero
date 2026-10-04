@@ -4,7 +4,8 @@ import {
   extractErrorInfo,
   isRetryableError,
   calculateRetryDelay,
-  withOutlookRetry,
+  withMicrosoftGraphRetry,
+  withMicrosoftGraphWriteRetry,
 } from "./retry";
 
 describe("extractErrorInfo", () => {
@@ -49,6 +50,21 @@ describe("extractErrorInfo", () => {
         message: "Rate limited",
       },
       expected: { status: 429, errorMessage: "Rate limited" },
+    },
+    {
+      name: "p-retry wrapped error",
+      error: {
+        error: {
+          statusCode: 429,
+          code: "TooManyRequests",
+          message: "Throttled",
+        },
+      },
+      expected: {
+        status: 429,
+        code: "TooManyRequests",
+        errorMessage: "Throttled",
+      },
     },
   ])("extracts $name", ({ error, expected }) => {
     expect(extractErrorInfo(error)).toMatchObject(expected);
@@ -166,24 +182,6 @@ describe("isRetryableError", () => {
 });
 
 describe("calculateRetryDelay", () => {
-  it("uses Retry-After header in seconds", () => {
-    const delay = calculateRetryDelay(true, false, false, 1, "10");
-    expect(delay).toBe(10_000); // 10 seconds in ms
-  });
-
-  it("uses Retry-After header as HTTP-date", () => {
-    const futureDate = new Date(Date.now() + 5000);
-    const delay = calculateRetryDelay(
-      true,
-      false,
-      false,
-      1,
-      futureDate.toUTCString(),
-    );
-    expect(delay).toBeGreaterThanOrEqual(4000);
-    expect(delay).toBeLessThanOrEqual(5000);
-  });
-
   it("falls back to 30s for rate limits without header", () => {
     const delay = calculateRetryDelay(true, false, false, 1);
     expect(delay).toBe(30_000);
@@ -212,7 +210,7 @@ describe("calculateRetryDelay", () => {
   });
 });
 
-describe("withOutlookRetry", () => {
+describe("withMicrosoftGraphRetry", () => {
   it("aborts retries when backoff exceeds max blocking delay", async () => {
     const operation = vi.fn().mockRejectedValue(
       Object.assign(new Error("Throttled"), {
@@ -222,9 +220,42 @@ describe("withOutlookRetry", () => {
     );
 
     await expect(
-      withOutlookRetry(operation, createTestLogger(), 5, 1),
+      withMicrosoftGraphRetry(operation, createTestLogger(), 5, 1),
     ).rejects.toBeDefined();
 
     expect(operation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("withMicrosoftGraphWriteRetry", () => {
+  it.each([
+    Object.assign(new Error("Service unavailable"), { statusCode: 503 }),
+    new Error("fetch failed"),
+    Object.assign(new Error("Change key conflict"), { statusCode: 412 }),
+  ])("does not repeat a write after an ambiguous failure", async (error) => {
+    const operation = vi.fn().mockRejectedValue(error);
+
+    await expect(
+      withMicrosoftGraphWriteRetry(operation, createTestLogger()),
+    ).rejects.toBeDefined();
+
+    expect(operation).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a write rejected by a rate limit", async () => {
+    const rateLimitError = Object.assign(new Error("Throttled"), {
+      statusCode: 429,
+      response: { headers: { "retry-after": "0" } },
+    });
+    const operation = vi
+      .fn()
+      .mockRejectedValueOnce(rateLimitError)
+      .mockResolvedValue("ok");
+
+    await expect(
+      withMicrosoftGraphWriteRetry(operation, createTestLogger(), 1),
+    ).resolves.toBe("ok");
+
+    expect(operation).toHaveBeenCalledTimes(2);
   });
 });

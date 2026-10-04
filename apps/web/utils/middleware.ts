@@ -3,6 +3,11 @@ import { type NextRequest, NextResponse, after } from "next/server";
 import { randomUUID } from "node:crypto";
 import * as Sentry from "@sentry/nextjs";
 import { captureException, checkCommonErrors, SafeError } from "@/utils/error";
+import {
+  isPublicApiPath,
+  publicApiErrorFromUnknown,
+  publicApiErrorResponse,
+} from "@/utils/public-api-error";
 import { env } from "@/env";
 import { logErrorToPosthog } from "@/utils/error.server";
 import { createScopedLogger, type Logger } from "@/utils/logger";
@@ -14,6 +19,7 @@ import { recordRateLimitFromApiError } from "@/utils/email/rate-limit";
 import { isProviderRateLimitModeError } from "@/utils/email/rate-limit-mode-error";
 import {
   EMAIL_ACCOUNT_HEADER,
+  EMAIL_ACCOUNT_ID_REQUIRED_ERROR,
   MICROSOFT_AUTH_EXPIRED_ERROR_CODE,
   NO_REFRESH_TOKEN_ERROR_CODE,
 } from "@/utils/config";
@@ -45,7 +51,7 @@ export interface RequestWithLogger extends NextRequest {
 
 // Extended request type with validated account info
 export interface RequestWithAuth extends RequestWithLogger {
-  auth: { userId: string };
+  auth: { userId: string; emailOtp?: boolean };
 }
 
 export interface RequestWithEmailAccount extends RequestWithLogger {
@@ -81,7 +87,7 @@ function withMiddleware<T extends NextRequest>(
     const requestId = getRequestId(req.headers.get("x-request-id"));
     const baseLogger = createScopedLogger(scope || "api").with({
       requestId,
-      url: req.url,
+      url: getRequestPath(req),
     });
     const requestTimer =
       options?.requestTiming !== undefined
@@ -135,8 +141,21 @@ function withMiddleware<T extends NextRequest>(
             throw error;
           }
 
+          const requestPath = getRequestPath(requestForError);
+          const publicApiRequest = isPublicApiPath(
+            new URL(requestForError.url).pathname,
+          );
+
           if (error instanceof SafeError) {
             if (error.message === "No refresh token") {
+              if (publicApiRequest) {
+                return publicApiErrorResponse({
+                  status: 401,
+                  code: "UNAUTHORIZED",
+                  message: "Authorization required. Please grant permissions.",
+                });
+              }
+
               return NextResponse.json(
                 {
                   error: "Authorization required. Please grant permissions.",
@@ -148,6 +167,16 @@ function withMiddleware<T extends NextRequest>(
             }
 
             if (error.message.includes("Microsoft authorization has expired")) {
+              if (publicApiRequest) {
+                return publicApiErrorResponse({
+                  status: 401,
+                  code: "UNAUTHORIZED",
+                  message:
+                    error.safeMessage ||
+                    "Microsoft authorization has expired. Please reconnect.",
+                });
+              }
+
               return NextResponse.json(
                 {
                   error: error.safeMessage,
@@ -165,17 +194,16 @@ function withMiddleware<T extends NextRequest>(
             if (!env.DISABLE_LOG_ZOD_ERRORS) {
               reqLogger.error("Zod validation error", { error });
             }
+            if (publicApiRequest) {
+              return publicApiErrorFromUnknown(error);
+            }
             return NextResponse.json(
               { error: { issues: error.issues }, isKnownError: true },
               { status: 400 },
             );
           }
 
-          const apiError = checkCommonErrors(
-            error,
-            requestForError.url,
-            reqLogger,
-          );
+          const apiError = checkCommonErrors(error, requestPath, reqLogger);
           if (apiError) {
             await recordRateLimitFromApiError({
               apiErrorType: apiError.type,
@@ -187,11 +215,18 @@ function withMiddleware<T extends NextRequest>(
 
             await logErrorToPosthog(
               "api",
-              requestForError.url,
+              requestPath,
               apiError.type,
               "unknown",
               reqLogger,
             ); // TODO: add emailAccountId
+
+            if (publicApiRequest) {
+              return publicApiErrorResponse({
+                status: apiError.code,
+                message: apiError.message || "Request failed",
+              });
+            }
 
             return NextResponse.json(
               { error: apiError.message, isKnownError: true },
@@ -204,6 +239,10 @@ function withMiddleware<T extends NextRequest>(
           }
 
           if (error instanceof SafeError) {
+            if (publicApiRequest) {
+              return publicApiErrorFromUnknown(error);
+            }
+
             return NextResponse.json(
               { error: error.safeMessage, isKnownError: true },
               { status: getSafeErrorStatusCode(error.statusCode) },
@@ -226,7 +265,17 @@ function withMiddleware<T extends NextRequest>(
                 : undefined,
             stack: error instanceof Error ? error.stack : undefined,
           });
-          captureException(error, { extra: { url: requestForError.url } });
+          captureException(error, {
+            extra: { url: requestPath },
+          });
+
+          if (publicApiRequest) {
+            return publicApiErrorResponse({
+              status: 500,
+              code: "INTERNAL_ERROR",
+              message: "An unexpected error occurred",
+            });
+          }
 
           return NextResponse.json(
             { error: "An unexpected error occurred" },
@@ -285,7 +334,10 @@ async function authMiddleware(
   }
 
   const authReq = req as RequestWithAuth;
-  authReq.auth = { userId: session.user.id };
+  authReq.auth = {
+    userId: session.user.id,
+    ...(session.session?.emailOtp ? { emailOtp: true } : {}),
+  };
 
   authReq.logger = baseLogger.with({ userId: session.user.id });
   setAuditContext({ actorType: "user", userId: session.user.id });
@@ -314,7 +366,7 @@ async function emailAccountMiddleware(
 
   if (!emailAccountId) {
     return NextResponse.json(
-      { error: "Email account ID is required", isKnownError: true },
+      { error: EMAIL_ACCOUNT_ID_REQUIRED_ERROR, isKnownError: true },
       { status: 403 },
     );
   }
@@ -689,12 +741,16 @@ function getRequestId(rawRequestId: string | null) {
   return randomUUID();
 }
 
+function getRequestPath(req: NextRequest) {
+  return req.nextUrl.pathname;
+}
+
 function flushLogger(req: NextRequest) {
   const reqWithLogger = req as RequestWithLogger;
   if (reqWithLogger.logger) {
     const loggerToFlush = reqWithLogger.logger;
     after(async () => {
-      await flushLoggerSafely(loggerToFlush, { url: req.url });
+      await flushLoggerSafely(loggerToFlush, { url: getRequestPath(req) });
     });
   }
 }

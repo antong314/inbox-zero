@@ -28,6 +28,7 @@ describe("getParameterFieldsForAction", () => {
     expect(result.label?.shape).toEqual({
       var1: expect.any(z.ZodString),
     });
+    expect(Object.keys(result)).toEqual(["label"]);
     const description =
       (result.label as any)?.description ||
       (result.label as any)?._def?.description;
@@ -107,6 +108,69 @@ describe("getParameterFieldsForAction", () => {
     const toDesc =
       (result.to as any)?.description || (result.to as any)?._def?.description;
     expect(toDesc).toContain("{{var1: recipient}}");
+  });
+
+  it("creates a whole-value schema for empty AI-filled integration args", () => {
+    const action = {
+      label: "",
+      subject: "",
+      content: "",
+      to: "",
+      cc: "",
+      bcc: "",
+      url: "",
+      integrationName: "todoist",
+      integrationToolName: "add-tasks",
+      integrationArgs: {
+        content: "",
+        description: "",
+        dueString: "ai",
+        projectId: "inbox",
+      },
+    };
+
+    const result = getParameterFieldsForAction(action);
+
+    // Empty text args and the "AI decides" due date all get filled by the AI;
+    // projectId is an explicit choice, so it is not sent to the model.
+    expect(Object.keys(result).sort()).toEqual([
+      "integrationArgs.content",
+      "integrationArgs.description",
+      "integrationArgs.dueString",
+    ]);
+    expect(result["integrationArgs.content"]?.shape).toEqual({
+      var1: expect.any(z.ZodString),
+    });
+  });
+
+  it("creates schemas for templated integrationArgs string values only", () => {
+    const action = {
+      label: "",
+      subject: "",
+      content: "",
+      to: "",
+      cc: "",
+      bcc: "",
+      url: "",
+      integrationName: "todoist",
+      integrationToolName: "add-tasks",
+      integrationArgs: {
+        content: "{{Short action item based on the email}}",
+        description: "Static description",
+        dueString: "today",
+        projectId: "inbox",
+      },
+    };
+
+    const result = getParameterFieldsForAction(action);
+
+    expect(Object.keys(result).sort()).toEqual(["integrationArgs.content"]);
+    const contentDesc =
+      (result["integrationArgs.content"] as any)?.description ||
+      (result["integrationArgs.content"] as any)?._def?.description;
+    expect(contentDesc).toContain(
+      "{{var1: Short action item based on the email}}",
+    );
   });
 });
 
@@ -210,8 +274,49 @@ describe("combineActionsWithAiArgs", () => {
       const result = combineActionsWithAiArgs(actions, aiArgs, null);
 
       expect(result[0].content).toBe(
-        "Dear Mr. Johnson,\n\nThank you for your email. I'd be happy to help with your request.\n\nBest regards",
+        "Dear Mr. Johnson,\n\nThank you for your email. I&#x27;d be happy to help with your request.\n\nBest regards",
       );
+    });
+
+    it("escapes AI-filled values in reply bodies but keeps the user's template text", () => {
+      const actions = [
+        createMockAction({
+          id: "1",
+          type: ActionType.DRAFT_EMAIL,
+          content: "<b>Hi</b> {{name}},\n\n{{reply}}",
+          label: "{{label}}",
+        }),
+        createMockAction({
+          id: "2",
+          type: ActionType.REPLY,
+          content: "{{reply}}",
+        }),
+        createMockAction({
+          id: "3",
+          type: ActionType.DRAFT_MESSAGING_CHANNEL,
+          content: "{{reply}}",
+        }),
+      ];
+
+      const result = combineActionsWithAiArgs(
+        actions,
+        {
+          "DRAFT_EMAIL-1": {
+            content: { var1: "Sam", var2: "Email <sam@example.com> & me" },
+            label: { var1: "A & B" },
+          },
+          "REPLY-2": { content: { var1: "a < b" } },
+          "DRAFT_MESSAGING_CHANNEL-3": { content: { var1: "a < b" } },
+        },
+        null,
+      );
+
+      expect(result[0].content).toBe(
+        "<b>Hi</b> Sam,\n\nEmail &lt;sam@example.com&gt; &amp; me",
+      );
+      expect(result[0].label).toBe("A & B");
+      expect(result[1].content).toBe("a &lt; b");
+      expect(result[2].content).toBe("a < b");
     });
 
     it("stores attribution for template-generated draft content", () => {
@@ -335,6 +440,77 @@ describe("combineActionsWithAiArgs", () => {
         "Some other draft",
         "Some other draft",
       ]);
+    });
+  });
+
+  describe("INTEGRATION action with templated args", () => {
+    it("fills templates inside integrationArgs string values", () => {
+      const actions = [
+        createMockAction({
+          id: "5",
+          type: ActionType.INTEGRATION,
+          content: null,
+          integrationName: "todoist",
+          integrationToolName: "add-tasks",
+          integrationArgs: {
+            content: "{{Short action item based on the email}}",
+            dueString: "{{due date mentioned in the email; omit if none}}",
+            projectId: "inbox",
+          },
+        }),
+      ];
+
+      const aiArgs = {
+        "INTEGRATION-5": {
+          "integrationArgs.content": { var1: "Send the signed lease" },
+          "integrationArgs.dueString": { var1: "" },
+        },
+      };
+
+      const result = combineActionsWithAiArgs(actions, aiArgs, null);
+
+      expect(result[0].integrationArgs).toEqual({
+        content: "Send the signed lease",
+        dueString: "",
+        projectId: "inbox",
+      });
+    });
+  });
+
+  describe("INTEGRATION action with AI-filled args", () => {
+    it("replaces an empty arg with the generated value", () => {
+      const actions = [
+        createMockAction({
+          id: "6",
+          type: ActionType.INTEGRATION,
+          content: null,
+          integrationName: "todoist",
+          integrationToolName: "add-tasks",
+          integrationArgs: {
+            content: "",
+            description: "",
+            dueString: "ai",
+            projectId: "inbox",
+          },
+        }),
+      ];
+
+      const aiArgs = {
+        "INTEGRATION-6": {
+          "integrationArgs.content": { var1: "Send the signed lease" },
+          "integrationArgs.description": { var1: "" },
+          "integrationArgs.dueString": { var1: "tomorrow" },
+        },
+      };
+
+      const result = combineActionsWithAiArgs(actions, aiArgs, null);
+
+      expect(result[0].integrationArgs).toEqual({
+        content: "Send the signed lease",
+        description: "",
+        dueString: "tomorrow",
+        projectId: "inbox",
+      });
     });
   });
 

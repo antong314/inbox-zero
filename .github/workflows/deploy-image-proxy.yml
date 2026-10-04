@@ -9,6 +9,7 @@ on:
     paths:
       - "apps/image-proxy/**"
       - "packages/image-proxy/**"
+      - "packages/network/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -54,7 +55,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bash scripts/pnpm-install-without-desktop.sh --frozen-lockfile
 
       - name: Ensure Cloudflare deploy config is present
         shell: bash

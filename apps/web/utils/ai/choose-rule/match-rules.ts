@@ -39,7 +39,14 @@ import {
   getColdEmailRule,
   isColdEmailRuleEnabled,
 } from "@/utils/cold-email/cold-email-rule";
-import { isColdEmail } from "@/utils/cold-email/is-cold-email";
+import {
+  checkColdEmailGuards,
+  checkColdEmailWithLlm,
+  type ColdEmailPatternMatch,
+  isColdEmail,
+} from "@/utils/cold-email/is-cold-email";
+import { decisionModelChooseRule } from "@/utils/decision-model/choose-rule";
+import { getDecisionModelConfig } from "@/utils/decision-model/decision-model";
 import { isConversationStatusType } from "@/utils/reply-tracker/conversation-status-config";
 import { getClassificationFeedback } from "@/utils/rule/classification-feedback";
 import {
@@ -60,6 +67,8 @@ const NO_REPLY_PREFIXES = [
   "updates@",
   "account@",
 ];
+
+type AiRuleCandidate = RuleWithActions & { instructions: string };
 
 type MatchingRulesResult = {
   matches: {
@@ -86,63 +95,201 @@ export async function findMatchingRules({
   logger: Logger;
 }): Promise<MatchingRulesResult> {
   const logger = log.with({ module: MODULE });
+  const isThread = provider.isReplyInThread(message);
+  const email = getEmailForLLM(message);
+  const decisionModel = await getDecisionModelConfig(emailAccount);
   const coldEmailRule = await getColdEmailRule(emailAccount.id);
 
+  // With a decision model, only the deterministic cold-email guards run here. When
+  // they can't decide, ask it about cold email alongside rule selection.
+  let pendingColdEmailRule: typeof coldEmailRule = null;
+
   if (coldEmailRule && isColdEmailRuleEnabled(coldEmailRule)) {
-    const coldEmailResult = await isColdEmail({
-      email: getEmailForLLM(message),
+    const coldEmailInput = {
+      email,
       emailAccount,
       provider,
-      modelType,
       coldEmailRule,
-    });
+      logger,
+    };
+    const coldEmailResult = decisionModel
+      ? await checkColdEmailGuards(coldEmailInput)
+      : await isColdEmail({ ...coldEmailInput, modelType });
 
-    if (coldEmailResult.isColdEmail) {
-      const coldRule = await prisma.rule.findUniqueOrThrow({
-        where: { id: coldEmailRule.id },
-        include: {
-          actions: true,
-        },
+    if (coldEmailResult?.isColdEmail) {
+      return buildColdEmailMatch({
+        coldEmailRuleId: coldEmailRule.id,
+        matchReasons: getColdEmailMatchReasons(coldEmailResult),
+        reasoning: getColdEmailReasoning(coldEmailResult),
+        selectionMetadata: createRuleSelectionMetadata({ isThread }),
       });
-
-      return {
-        matches: [
-          {
-            rule: coldRule,
-            matchReasons: coldEmailResult.patternMatch
-              ? [
-                  {
-                    type: ConditionType.LEARNED_PATTERN,
-                    group: coldEmailResult.patternMatch.group,
-                    groupItem: coldEmailResult.patternMatch.groupItem,
-                  },
-                ]
-              : [{ type: ConditionType.AI }],
-          },
-        ],
-        reasoning: coldEmailResult.aiReason || coldEmailResult.reason,
-        selectionMetadata: createRuleSelectionMetadata({
-          isThread: provider.isReplyInThread(message),
-        }),
-      };
     }
+
+    if (!coldEmailResult) pendingColdEmailRule = coldEmailRule;
   }
 
-  // Filter out cold email rule which was already checked above
+  // The cold email rule is decided separately above
   const rulesWithoutColdEmail = rules.filter(
     (rule) => rule.systemType !== SystemType.COLD_EMAIL,
   );
 
-  const results = await findMatchingRulesWithReasons(
-    rulesWithoutColdEmail,
-    message,
+  const { matches, potentialAiMatches, selectionMetadata } =
+    await findPotentialMatchingRules({
+      rules: rulesWithoutColdEmail,
+      message,
+      isThread,
+      provider,
+      emailAccountId: emailAccount.id,
+      logger,
+    });
+
+  const senderEmail = extractEmailAddress(message.headers.from);
+  const classificationFeedback =
+    potentialAiMatches.length && senderEmail
+      ? await getClassificationFeedback({
+          emailAccountId: emailAccount.id,
+          senderEmail,
+          provider,
+          logger,
+        })
+      : null;
+
+  if (decisionModel && (potentialAiMatches.length || pendingColdEmailRule)) {
+    const selection = await decisionModelChooseRule({
+      decisionModel,
+      message,
+      emailAccount,
+      rules: potentialAiMatches,
+      coldEmailRule: pendingColdEmailRule,
+      classificationFeedback,
+      logger,
+    }).catch((error) => {
+      logger.warn(
+        "Decision-model rule selection failed, falling back to LLM path",
+        {
+          error,
+        },
+      );
+      return null;
+    });
+
+    if (selection) {
+      if (selection.type === "coldEmail" && pendingColdEmailRule) {
+        return buildColdEmailMatch({
+          coldEmailRuleId: pendingColdEmailRule.id,
+          matchReasons: [{ type: ConditionType.AI }],
+          reasoning: selection.reason,
+          selectionMetadata,
+        });
+      }
+      // Settled, so the LLM check below must not re-ask it.
+      pendingColdEmailRule = null;
+
+      if (selection.type === "rules") {
+        return mergeAiResultsIntoMatches({
+          matches,
+          aiResult: selection,
+          selectionMetadata,
+        });
+      }
+
+      logger.info("Decision model deferred the rule choice to the LLM path", {
+        reason: selection.reason,
+      });
+    }
+  }
+
+  // Only reached with a pending cold-email rule when the decision model failed.
+  if (pendingColdEmailRule) {
+    const coldEmailResult = await checkColdEmailWithLlm({
+      email,
+      emailAccount,
+      modelType,
+      coldEmailRule: pendingColdEmailRule,
+      logger,
+    });
+
+    if (coldEmailResult.isColdEmail) {
+      return buildColdEmailMatch({
+        coldEmailRuleId: pendingColdEmailRule.id,
+        matchReasons: getColdEmailMatchReasons(coldEmailResult),
+        reasoning: getColdEmailReasoning(coldEmailResult),
+        selectionMetadata,
+      });
+    }
+  }
+
+  if (!potentialAiMatches.length) {
+    return {
+      matches,
+      reasoning: getMatchesReasoning(matches),
+      selectionMetadata,
+    };
+  }
+
+  const llmResult = await aiChooseRule({
+    email,
+    rules: potentialAiMatches,
     emailAccount,
-    provider,
     modelType,
     logger,
-  );
+    classificationFeedback,
+  });
 
-  return results;
+  return mergeAiResultsIntoMatches({
+    matches,
+    aiResult: llmResult,
+    selectionMetadata,
+  });
+}
+
+function getColdEmailMatchReasons(result: {
+  patternMatch?: ColdEmailPatternMatch;
+}): MatchReason[] {
+  return result.patternMatch
+    ? [
+        {
+          type: ConditionType.LEARNED_PATTERN,
+          group: result.patternMatch.group,
+          groupItem: result.patternMatch.groupItem,
+        },
+      ]
+    : [{ type: ConditionType.AI }];
+}
+
+function getColdEmailReasoning(result: {
+  reason: string;
+  aiReason?: string | null;
+}) {
+  if (result.aiReason) return result.aiReason;
+  if (result.reason === "ai-already-labeled")
+    return "The sender matches a learned pattern for this rule.";
+  return "";
+}
+
+async function buildColdEmailMatch({
+  coldEmailRuleId,
+  matchReasons,
+  reasoning,
+  selectionMetadata,
+}: {
+  coldEmailRuleId: string;
+  matchReasons: MatchReason[];
+  reasoning: string;
+  selectionMetadata: RuleSelectionMetadata;
+}): Promise<MatchingRulesResult> {
+  const coldRule = await prisma.rule.findUniqueOrThrow({
+    where: { id: coldEmailRuleId },
+    include: {
+      actions: true,
+    },
+  });
+
+  return {
+    matches: [{ rule: coldRule, matchReasons }],
+    reasoning,
+    selectionMetadata,
+  };
 }
 
 /**
@@ -184,7 +331,7 @@ async function findPotentialMatchingRules({
     rule: RuleWithActions;
     matchReasons: MatchReason[];
   }[] = [];
-  const potentialAiMatches: (RuleWithActions & { instructions: string })[] = [];
+  const potentialAiMatches: AiRuleCandidate[] = [];
   const skippedThreadRuleNames: string[] = [];
   const continuedThreadRuleNames: string[] = [];
   const learnedPatternExcludedRules: RuleSelectionMetadata["learnedPatternExcludedRules"] =
@@ -513,61 +660,23 @@ function createRuleSelectionMetadata({
   };
 }
 
-async function findMatchingRulesWithReasons(
-  rules: RuleWithActions[],
-  message: ParsedMessage,
-  emailAccount: EmailAccountWithAI,
-  provider: EmailProvider,
-  modelType: ModelType,
-  logger: Logger,
-): Promise<MatchingRulesResult> {
-  const isThread = provider.isReplyInThread(message);
-
-  const { matches, potentialAiMatches, selectionMetadata } =
-    await findPotentialMatchingRules({
-      rules,
-      message,
-      isThread,
-      provider,
-      emailAccountId: emailAccount.id,
-      logger,
-    });
-
-  if (potentialAiMatches.length) {
-    const senderEmail = extractEmailAddress(message.headers.from);
-    const classificationFeedback = senderEmail
-      ? await getClassificationFeedback({
-          emailAccountId: emailAccount.id,
-          senderEmail,
-          provider,
-          logger,
-        })
-      : null;
-
-    const fullResult = await aiChooseRule({
-      email: getEmailForLLM(message),
-      rules: potentialAiMatches,
-      emailAccount,
-      modelType,
-      logger,
-      classificationFeedback,
-    });
-
-    const aiRules = filterMultipleSystemRules(fullResult.rules);
-
-    return {
-      matches: mergeMatchesWithAiResults(matches, aiRules),
-      reasoning: combineReasoning(
-        getMatchesReasoning(matches),
-        fullResult.reason,
-      ),
-      selectionMetadata,
-    };
-  }
+function mergeAiResultsIntoMatches({
+  matches,
+  aiResult,
+  selectionMetadata,
+}: {
+  matches: { rule: RuleWithActions; matchReasons?: MatchReason[] }[];
+  aiResult: {
+    rules: { rule: AiRuleCandidate; isPrimary?: boolean }[];
+    reason: string;
+  };
+  selectionMetadata: RuleSelectionMetadata;
+}): MatchingRulesResult {
+  const aiRules = filterMultipleSystemRules(aiResult.rules);
 
   return {
-    matches,
-    reasoning: getMatchesReasoning(matches),
+    matches: mergeMatchesWithAiResults(matches, aiRules),
+    reasoning: combineReasoning(getMatchesReasoning(matches), aiResult.reason),
     selectionMetadata,
   };
 }

@@ -15,12 +15,10 @@ import {
 } from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/common";
 import type { RowProps } from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/types";
 import { ButtonCheckbox } from "@/components/ButtonCheckbox";
-import { DomainIcon } from "@/components/charts/DomainIcon";
+import { SenderIcon } from "@/components/SenderIcon";
 import { Progress } from "@/components/ui/progress";
-import { extractDomainFromEmail } from "@/utils/email";
 import { cn } from "@/utils";
-
-const LOW_READ_THRESHOLD = 30;
+import { isUnsubscribeSuggestion } from "@/app/(app)/[emailAccountId]/bulk-unsubscribe/suggestions";
 
 export function BulkUnsubscribeDesktop({
   tableRows,
@@ -40,49 +38,60 @@ export function BulkUnsubscribeDesktop({
   onToggleSelectAll: () => void;
 }) {
   return (
-    <Table className="bulk-unsub-table">
-      <TableHeader>
-        <TableRow>
-          <TableHead className="w-10 pr-0">
-            <ButtonCheckbox
-              label={
-                isAllSelected ? "Deselect all senders" : "Select all senders"
-              }
-              checked={isAllSelected}
-              indeterminate={isSomeSelected && !isAllSelected}
-              onChange={() => onToggleSelectAll()}
-            />
-          </TableHead>
-          <TableHead className="pl-8">
-            <span className="text-sm font-medium">From</span>
-          </TableHead>
-          <TableHead className="whitespace-nowrap">
-            <HeaderButton
-              sorted={sortColumn === "emails"}
-              sortDirection={
-                sortColumn === "emails" ? sortDirection : undefined
-              }
-              onClick={() => onSort("emails")}
-            >
-              Emails
-            </HeaderButton>
-          </TableHead>
-          <TableHead className="whitespace-nowrap">
-            <HeaderButton
-              sorted={sortColumn === "unread"}
-              sortDirection={
-                sortColumn === "unread" ? sortDirection : undefined
-              }
-              onClick={() => onSort("unread")}
-            >
-              Read
-            </HeaderButton>
-          </TableHead>
-          <TableHead className="w-[280px]" />
-        </TableRow>
-      </TableHeader>
-      <TableBody>{tableRows}</TableBody>
-    </Table>
+    // Only let the header stick to the page once the widest rows fit (~927px);
+    // narrower, e.g. with the chat sidebar open, the table keeps its own
+    // horizontal scroll so the actions column isn't clipped.
+    <div className="[container-type:inline-size]">
+      <Table
+        className="bulk-unsub-table"
+        containerClassName="[@container(min-width:928px)]:overflow-visible"
+      >
+        <TableHeader
+          sticky
+          className="[&_th:first-child]:rounded-tl-lg [&_th:last-child]:rounded-tr-lg"
+        >
+          <TableRow>
+            <TableHead className="w-10 pr-0">
+              <ButtonCheckbox
+                label={
+                  isAllSelected ? "Deselect all senders" : "Select all senders"
+                }
+                checked={isAllSelected}
+                indeterminate={isSomeSelected && !isAllSelected}
+                onChange={() => onToggleSelectAll()}
+              />
+            </TableHead>
+            <TableHead className="pl-8">
+              <span className="text-sm font-medium">From</span>
+            </TableHead>
+            <TableHead className="whitespace-nowrap">
+              <HeaderButton
+                sorted={sortColumn === "emails"}
+                sortDirection={
+                  sortColumn === "emails" ? sortDirection : undefined
+                }
+                onClick={() => onSort("emails")}
+              >
+                Emails
+              </HeaderButton>
+            </TableHead>
+            <TableHead className="whitespace-nowrap">
+              <HeaderButton
+                sorted={sortColumn === "unread"}
+                sortDirection={
+                  sortColumn === "unread" ? sortDirection : undefined
+                }
+                onClick={() => onSort("unread")}
+              >
+                Read
+              </HeaderButton>
+            </TableHead>
+            <TableHead className="w-[280px]" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>{tableRows}</TableBody>
+      </Table>
+    </div>
   );
 }
 
@@ -104,8 +113,7 @@ export function BulkUnsubscribeRowDesktop({
   filter,
   readPercentage,
 }: RowProps) {
-  const domain = extractDomainFromEmail(item.name) || item.name;
-  const isLowReadRate = readPercentage < LOW_READ_THRESHOLD;
+  const isSuggested = isUnsubscribeSuggestion(item);
 
   return (
     <TableRow
@@ -128,7 +136,7 @@ export function BulkUnsubscribeRowDesktop({
         data-cell="from"
       >
         <div className="flex items-center gap-2 min-w-0">
-          <DomainIcon domain={domain} size={32} variant="circular" />
+          <SenderIcon email={item.name} name={item.fromName} size={32} />
           <div className="min-w-0 lg:flex lg:items-baseline lg:gap-2">
             <div className="truncate font-medium">
               {item.fromName || item.name}
@@ -150,16 +158,16 @@ export function BulkUnsubscribeRowDesktop({
             value={readPercentage}
             className={cn(
               "h-1.5 w-16",
-              isLowReadRate ? "bg-amber-100 dark:bg-amber-950" : "bg-muted",
+              isSuggested ? "bg-amber-100 dark:bg-amber-950" : "bg-muted",
             )}
             innerClassName={
-              isLowReadRate ? "bg-amber-400" : "bg-slate-300 dark:bg-slate-500"
+              isSuggested ? "bg-amber-400" : "bg-slate-300 dark:bg-slate-500"
             }
           />
           <span
             className={cn(
               "font-medium",
-              isLowReadRate
+              isSuggested
                 ? "text-amber-600 dark:text-amber-400"
                 : "text-foreground/80",
             )}

@@ -1,3 +1,4 @@
+import { CALENDAR_INVITATION_LIMITS } from "@/utils/calendar/invitations/constants";
 import type { gmail_v1 } from "@googleapis/gmail";
 import {
   type MessageWithPayload,
@@ -13,15 +14,41 @@ import { isIgnoredSender } from "@/utils/filter-ignored-senders";
 import parse from "gmail-api-parse-message";
 import { withGmailRetry } from "@/utils/gmail/retry";
 import type { Logger } from "@/utils/logger";
+import { getEmbeddedGmailAttachmentDescriptors } from "./attachment";
 
 export function parseMessage(
   message: MessageWithPayload,
+  options?: { includeCalendarContent?: boolean },
 ): ParsedMessage & { subject: string; date: string } {
   const parsed = parse(message) as ParsedMessage;
+  const calendarParts = getCalendarParts(message.payload);
+  const calendarData =
+    calendarParts.length === 1 ? calendarParts[0].body?.data : undefined;
+  const parts = [
+    ...(parsed.attachments ?? []),
+    ...(parsed.inline ?? []),
+  ].filter((part) => part.attachmentId);
+  parts.push(...getEmbeddedGmailAttachmentDescriptors(message.payload));
+  const inlineAttachments = parts.filter(isInlineAttachment);
+  const attachments = parts.filter(
+    (attachment) => !isInlineAttachment(attachment),
+  );
+
   return {
     ...parsed,
+    isMeetingInvitation: calendarParts.length
+      ? calendarParts.length === 1
+      : undefined,
+    calendarContent:
+      options?.includeCalendarContent &&
+      calendarData &&
+      calendarData.length <= CALENDAR_INVITATION_LIMITS.encoded
+        ? Buffer.from(calendarData, "base64").toString("utf8")
+        : undefined,
+    attachments: attachments?.length ? attachments : undefined,
     subject: parsed.headers?.subject || "",
     date: parsed.headers?.date || "",
+    inline: inlineAttachments,
     // gmail-api-parse-message converts internalDate to a number, but our type expects string
     internalDate:
       parsed.internalDate != null ? String(parsed.internalDate) : null,
@@ -185,6 +212,7 @@ export async function getMessages(
     maxResults?: number;
     pageToken?: string;
     labelIds?: string[];
+    includeSpamTrash?: boolean;
   },
 ): Promise<{
   messages: {
@@ -200,6 +228,7 @@ export async function getMessages(
       q: options.query,
       pageToken: options.pageToken,
       labelIds: options.labelIds,
+      includeSpamTrash: options.includeSpamTrash,
     }),
   );
 
@@ -213,6 +242,19 @@ function isMessage(
   message: gmail_v1.Schema$Message,
 ): message is { id: string; threadId: string } {
   return !!message.id && !!message.threadId;
+}
+
+function isInlineAttachment(
+  attachment: NonNullable<ParsedMessage["attachments"]>[number],
+) {
+  const disposition = attachment.headers["content-disposition"]
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  return (
+    disposition === "inline" ||
+    (!disposition && Boolean(attachment.headers["content-id"]))
+  );
 }
 
 export async function queryBatchMessages(
@@ -256,35 +298,6 @@ export async function queryBatchMessages(
   };
 }
 
-// loops through multiple pages of messages
-export async function queryBatchMessagesPages(
-  gmail: gmail_v1.Gmail,
-  {
-    query,
-    maxResults,
-    logger,
-  }: {
-    query: string;
-    maxResults: number;
-    logger: Logger;
-  },
-) {
-  const messages: ParsedMessage[] = [];
-  let nextPageToken: string | undefined;
-  do {
-    const { messages: pageMessages, nextPageToken: nextToken } =
-      await queryBatchMessages(gmail, {
-        query,
-        pageToken: nextPageToken,
-        logger,
-      });
-    messages.push(...pageMessages);
-    nextPageToken = nextToken || undefined;
-  } while (nextPageToken && messages.length < maxResults);
-
-  return messages;
-}
-
 export async function getSentMessages(
   gmail: gmail_v1.Gmail,
   logger: Logger,
@@ -296,4 +309,16 @@ export async function getSentMessages(
     logger,
   });
   return messages.messages;
+}
+
+function getCalendarParts(
+  part: gmail_v1.Schema$MessagePart | undefined,
+): gmail_v1.Schema$MessagePart[] {
+  if (!part) return [];
+  const parts = part.mimeType?.toLowerCase() === "text/calendar" ? [part] : [];
+  for (const child of part.parts ?? []) {
+    parts.push(...getCalendarParts(child));
+    if (parts.length > 1) break;
+  }
+  return parts;
 }

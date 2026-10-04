@@ -1,8 +1,11 @@
-import pRetry from "p-retry";
 import type { Logger } from "@/utils/logger";
-import { sleep } from "@/utils/sleep";
 import { isFetchError } from "@/utils/retry/is-fetch-error";
 import { getRetryAfterHeaderFromError } from "@/utils/retry/get-retry-after-header";
+import {
+  getRetryAfterDelayMs,
+  type ProviderRetryPolicy,
+  withProviderRetry,
+} from "@/utils/retry/provider-retry";
 
 interface ErrorInfo {
   code?: string;
@@ -14,82 +17,46 @@ interface ErrorInfo {
 // Intentionally lower than Microsoft's common 30s throttle backoff so serverless
 // requests fail fast instead of sleeping into function timeout budgets.
 // Non-serverless callers can pass a higher maxBlockingDelayMs when needed.
-export const MAX_OUTLOOK_BLOCKING_RETRY_DELAY_MS = 10_000;
+export const MAX_MICROSOFT_GRAPH_BLOCKING_RETRY_DELAY_MS = 10_000;
 
 /**
  * Retries a Microsoft Graph API operation when rate limits or temporary server errors are encountered
  * - Rate limits: 429, "TooManyRequests", "ApplicationThrottled", "MailboxConcurrency"
  * - Server errors: 502, 503, 504, "ServiceNotAvailable", "ServerBusy"
  */
-export async function withOutlookRetry<T>(
+export async function withMicrosoftGraphRetry<T>(
   operation: () => Promise<T>,
   logger: Logger,
   maxRetries = 5,
-  maxBlockingDelayMs = MAX_OUTLOOK_BLOCKING_RETRY_DELAY_MS,
+  maxBlockingDelayMs = MAX_MICROSOFT_GRAPH_BLOCKING_RETRY_DELAY_MS,
 ): Promise<T> {
-  return pRetry(operation, {
-    retries: maxRetries,
-    onFailedAttempt: async (error) => {
-      const errorInfo = extractErrorInfo(error);
-      const { retryable, isRateLimit, isServerError, isConflictError } =
-        isRetryableError(errorInfo);
+  return withMicrosoftGraphRetryPolicy(
+    operation,
+    logger,
+    maxRetries,
+    maxBlockingDelayMs,
+    "all",
+  );
+}
 
-      if (!retryable) {
-        logger.warn("Non-retryable error encountered", {
-          error,
-          status: errorInfo.status,
-          code: errorInfo.code,
-          responseBody: errorInfo.responseBody,
-        });
-        throw error;
-      }
-
-      const retryAfterHeader = getRetryAfterHeaderFromError(error);
-
-      const delayMs = calculateRetryDelay(
-        isRateLimit,
-        isServerError,
-        isConflictError,
-        error.attemptNumber,
-        retryAfterHeader,
-      );
-
-      logger.warn("Microsoft Graph error. Will retry", {
-        delaySeconds: Math.ceil(delayMs / 1000),
-        attemptNumber: error.attemptNumber,
-        maxRetries,
-        maxBlockingDelaySeconds: Math.ceil(maxBlockingDelayMs / 1000),
-        status: errorInfo.status,
-        code: errorInfo.code,
-        isRateLimit,
-        isServerError,
-        isConflictError,
-        isFetchError: isFetchError(errorInfo),
-        retryAfterHeader,
-        responseBody: errorInfo.responseBody,
-      });
-
-      if (delayMs > maxBlockingDelayMs) {
-        logger.warn("Aborting retry due to long backoff in serverless", {
-          delaySeconds: Math.ceil(delayMs / 1000),
-          maxBlockingDelaySeconds: Math.ceil(maxBlockingDelayMs / 1000),
-          attemptNumber: error.attemptNumber,
-          maxRetries,
-          status: errorInfo.status,
-          code: errorInfo.code,
-          isRateLimit,
-          isServerError,
-          isConflictError,
-        });
-        throw error;
-      }
-
-      // Apply the custom delay
-      if (delayMs > 0) {
-        await sleep(delayMs);
-      }
-    },
-  });
+/**
+ * Retries a non-idempotent Microsoft Graph write only when Graph explicitly
+ * rejects it because of throttling. Network, server, and conflict failures are
+ * ambiguous because the write may already have succeeded.
+ */
+export async function withMicrosoftGraphWriteRetry<T>(
+  operation: () => Promise<T>,
+  logger: Logger,
+  maxRetries = 5,
+  maxBlockingDelayMs = MAX_MICROSOFT_GRAPH_BLOCKING_RETRY_DELAY_MS,
+): Promise<T> {
+  return withMicrosoftGraphRetryPolicy(
+    operation,
+    logger,
+    maxRetries,
+    maxBlockingDelayMs,
+    "rate-limit-only",
+  );
 }
 
 /**
@@ -97,21 +64,23 @@ export async function withOutlookRetry<T>(
  */
 export function extractErrorInfo(error: unknown): ErrorInfo {
   const err = error as Record<string, unknown>;
+  const nestedError = err?.error as Record<string, unknown> | undefined;
 
   const status =
     (err?.statusCode as number) ??
     (err?.status as number) ??
     ((err?.response as Record<string, unknown>)?.status as number) ??
+    (nestedError?.statusCode as number) ??
+    (nestedError?.status as number) ??
+    ((nestedError?.response as Record<string, unknown>)?.status as number) ??
     undefined;
 
   const code =
-    (err?.code as string) ??
-    ((err?.error as Record<string, unknown>)?.code as string) ??
-    undefined;
+    (err?.code as string) ?? (nestedError?.code as string) ?? undefined;
 
   const primaryMessage =
     (err?.message as string) ??
-    ((err?.error as Record<string, unknown>)?.message as string) ??
+    (nestedError?.message as string) ??
     (err?.body as string) ??
     "";
 
@@ -181,23 +150,8 @@ export function calculateRetryDelay(
   attemptNumber: number,
   retryAfterHeader?: string,
 ): number {
-  // Handle Retry-After header
-  if (retryAfterHeader) {
-    const retryAfterSeconds = Number.parseInt(retryAfterHeader, 10);
-    if (!Number.isNaN(retryAfterSeconds)) {
-      return retryAfterSeconds * 1000;
-    }
-
-    // Try parsing as HTTP-date
-    const retryDate = new Date(retryAfterHeader);
-    if (!Number.isNaN(retryDate.getTime())) {
-      const delayMs = Math.max(0, retryDate.getTime() - Date.now());
-      if (delayMs > 0) {
-        return delayMs;
-      }
-      // If stale, fall through to fallback logic
-    }
-  }
+  const retryAfterDelayMs = getRetryAfterDelayMs(retryAfterHeader);
+  if (retryAfterDelayMs !== undefined) return retryAfterDelayMs;
 
   // Use different fallback delays based on error type
   if (isConflictError) {
@@ -218,4 +172,48 @@ export function calculateRetryDelay(
 
   // Default exponential backoff for other retryable errors: 1s, 2s, 4s, 8s, 16s
   return Math.min(1000 * 2 ** (attemptNumber - 1), 16_000);
+}
+
+async function withMicrosoftGraphRetryPolicy<T>(
+  operation: () => Promise<T>,
+  logger: Logger,
+  maxRetries: number,
+  maxBlockingDelayMs: number,
+  retryPolicy: ProviderRetryPolicy,
+): Promise<T> {
+  return withProviderRetry(operation, {
+    providerName: "Microsoft Graph",
+    logger,
+    maxRetries,
+    maxBlockingDelayMs,
+    retryPolicy,
+    classify: (attempt) => {
+      const errorInfo = extractErrorInfo(attempt);
+      const { retryable, isRateLimit, isServerError, isConflictError } =
+        isRetryableError(errorInfo);
+      const retryAfterHeader = getRetryAfterHeaderFromError(attempt);
+
+      return {
+        retryable,
+        isRateLimit,
+        delayMs: calculateRetryDelay(
+          isRateLimit,
+          isServerError,
+          isConflictError,
+          attempt.attemptNumber,
+          retryAfterHeader,
+        ),
+        logFields: {
+          status: errorInfo.status,
+          code: errorInfo.code,
+          isRateLimit,
+          isServerError,
+          isConflictError,
+          isFetchError: isFetchError(errorInfo),
+          retryAfterHeader,
+          responseBody: errorInfo.responseBody,
+        },
+      };
+    },
+  });
 }

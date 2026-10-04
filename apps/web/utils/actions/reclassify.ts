@@ -152,7 +152,7 @@ export const reclassifyMessagesAction = actionClient
                 previousExecutionsByMessageId[inputMessage.messageId] ?? [];
               const previousClassificationRules = previousRules.filter(
                 (execution) =>
-                  execution.rule.systemType &&
+                  execution.rule?.systemType &&
                   shouldLearnFromLabelRemoval(execution.rule.systemType),
               );
               const wrongRuleExecutions = previousClassificationRules.filter(

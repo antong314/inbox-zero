@@ -23,6 +23,7 @@ const {
   mockStartBulkCategorization,
   mockGetCategorizationProgress,
   mockGetCategorizationStatusSnapshot,
+  mockIsIntegrationActionEnabledForUserId,
 } = vi.hoisted(() => ({
   envState: {
     sendEmailEnabled: true,
@@ -55,6 +56,9 @@ const {
       findFirst: vi.fn().mockResolvedValue(null),
       findMany: vi.fn().mockResolvedValue([]),
     },
+    calendarConnection: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
     executedRule: {
       findMany: vi.fn().mockResolvedValue([]),
     },
@@ -64,6 +68,7 @@ const {
   mockStartBulkCategorization: vi.fn(),
   mockGetCategorizationProgress: vi.fn(),
   mockGetCategorizationStatusSnapshot: vi.fn(),
+  mockIsIntegrationActionEnabledForUserId: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("@/utils/llms", () => ({
@@ -76,6 +81,10 @@ vi.mock("@/utils/email/provider", () => ({
 
 vi.mock("@/utils/posthog", () => ({
   posthogCaptureEvent: mockPosthogCaptureEvent,
+}));
+
+vi.mock("@/utils/integration-action.server", () => ({
+  isIntegrationActionEnabledForUserId: mockIsIntegrationActionEnabledForUserId,
 }));
 
 vi.mock("@/utils/senders/unsubscribe", () => ({
@@ -168,12 +177,36 @@ async function captureToolSet(
   return mockToolCallAgentStream.mock.calls[0][0].tools;
 }
 
+async function captureCalendarChat(
+  connections: Array<{ provider: string; refreshToken: string | null }>,
+) {
+  mockPrisma.calendarConnection.findMany.mockResolvedValue(connections);
+
+  const { aiProcessAssistantChat } = await loadAssistantChatModule({
+    emailSend: true,
+  });
+
+  mockToolCallAgentStream.mockResolvedValue({
+    toUIMessageStreamResponse: vi.fn(),
+  });
+
+  await aiProcessAssistantChat({
+    messages: baseMessages,
+    emailAccountId: "email-account-id",
+    user: getEmailAccount(),
+    logger,
+  });
+
+  return mockToolCallAgentStream.mock.calls[0][0];
+}
+
 describe("aiProcessAssistantChat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     envState.sendEmailEnabled = true;
     envState.autoDraftDisabled = false;
     envState.webhookActionsEnabled = true;
+    mockPrisma.calendarConnection.findMany.mockResolvedValue([]);
   });
 
   it("registers expected core and send tools when email sending is enabled", async () => {
@@ -214,7 +247,7 @@ describe("aiProcessAssistantChat", () => {
   }, 30_000);
 
   it.each([
-    ["web", 240_000],
+    ["web", 720_000],
     ["messaging", 60_000],
   ] as const)(
     "continues %s tool calls without a step cap and reserves time for a final response",
@@ -245,10 +278,12 @@ describe("aiProcessAssistantChat", () => {
         expect(args.stopWhen()).toBe(false);
 
         vi.advanceTimersByTime(toolBudgetMs - 1);
-        expect(await args.prepareStep()).toBeUndefined();
+        expect(
+          await args.prepareStep({ messages: baseMessages }),
+        ).toBeUndefined();
 
         vi.advanceTimersByTime(1);
-        expect(await args.prepareStep()).toEqual({
+        expect(await args.prepareStep({ messages: baseMessages })).toEqual({
           activeTools: [],
           toolChoice: "none",
         });
@@ -308,6 +343,98 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     expect(args.tools.sendEmail).toBeUndefined();
     expect(args.tools.forwardEmail).toBeUndefined();
+  });
+
+  it.each([
+    {
+      title: "omits calendar tools when the account has no connection",
+      connections: [],
+      enabled: false,
+    },
+    {
+      title:
+        "includes calendar tools when a connected google calendar has a refresh token",
+      connections: [{ provider: "google", refreshToken: "refresh-token" }],
+      enabled: true,
+    },
+    {
+      title:
+        "includes calendar tools when a connected microsoft calendar has a refresh token",
+      connections: [{ provider: "microsoft", refreshToken: "refresh-token" }],
+      enabled: true,
+    },
+    {
+      title:
+        "omits calendar tools when the only connection has no refresh token",
+      connections: [{ provider: "google", refreshToken: null }],
+      enabled: false,
+    },
+    {
+      title:
+        "omits calendar tools when the only connection uses an unsupported provider",
+      connections: [{ provider: "fastmail", refreshToken: "refresh-token" }],
+      enabled: false,
+    },
+    {
+      title:
+        "includes calendar tools when one connection is usable and another is not",
+      connections: [
+        { provider: "google", refreshToken: null },
+        { provider: "microsoft", refreshToken: "refresh-token" },
+      ],
+      enabled: true,
+    },
+  ])("$title", async ({ connections, enabled }) => {
+    const args = await captureCalendarChat(connections);
+    const systemPrompt = String(args.messages[0].content);
+
+    expect(mockPrisma.calendarConnection.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          emailAccountId: "email-account-id",
+          isConnected: true,
+        },
+      }),
+    );
+    expect(systemPrompt).toContain("calendar or inbox date-range tools");
+    expect(systemPrompt).not.toContain("Do not call a calendar tool");
+
+    if (enabled) {
+      expect(args.tools.getCalendarEvents).toBeDefined();
+      expect(systemPrompt).not.toContain("connect a calendar");
+      return;
+    }
+
+    expect(args.tools.getCalendarEvents).toBeUndefined();
+    expect(systemPrompt).toContain("connect a calendar in settings");
+  });
+
+  it("tells the model when the calendar connection lookup fails", async () => {
+    const error = new Error(
+      "db down postgres://user:secret@localhost/db bearer session-token\n    at Connection.connect",
+    );
+    mockPrisma.calendarConnection.findMany.mockRejectedValue(error);
+    const errorSpy = vi.spyOn(logger, "error");
+
+    const tools = await captureToolSet();
+    const systemPrompt = String(
+      mockToolCallAgentStream.mock.calls[0][0].messages[0].content,
+    );
+
+    expect(tools.getCalendarEvents).toBeUndefined();
+    expect(systemPrompt).toContain(
+      "Checking the calendar connection failed (Error: db down postgres://[redacted]@localhost/db bearer [redacted])",
+    );
+    expect(systemPrompt).toContain(
+      "reconnect their calendar in settings or try again",
+    );
+    expect(systemPrompt).not.toContain("secret");
+    expect(systemPrompt).not.toContain("Connection.connect");
+    expect(errorSpy).toHaveBeenCalledWith(
+      "Failed to check calendar connection for chat tools",
+      expect.objectContaining({ error }),
+    );
+    errorSpy.mockRestore();
   });
 
   it("uses one email-capabilities block when send and draft-reply are both disabled", async () => {
@@ -786,8 +913,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).toContain(
@@ -858,8 +984,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     const content = hiddenContext?.content ?? "";
@@ -925,8 +1050,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).toContain(
@@ -982,8 +1106,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).not.toContain(
@@ -1044,8 +1167,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).toContain(
@@ -1107,8 +1229,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).not.toContain(
@@ -1167,8 +1288,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).toContain(
@@ -1238,8 +1358,7 @@ describe("aiProcessAssistantChat", () => {
     const args = mockToolCallAgentStream.mock.calls[0][0];
     const hiddenContext = args.messages.find(
       (message: { role: string; content: string }) =>
-        message.role === "user" &&
-        message.content.includes("Hidden context for the user's request"),
+        message.role === "user" && message.content.startsWith("Hidden context"),
     );
 
     expect(hiddenContext?.content).not.toContain(
@@ -1717,6 +1836,12 @@ describe("aiProcessAssistantChat", () => {
     expect(result).toEqual({
       messageId: "message-1",
       threadId: "thread-1",
+      evidence: {
+        state: "RECORDED_EXECUTIONS",
+        rootCauseKnown: null,
+        summary:
+          "Recorded rule executions are available. Use each execution's rule, status, reason, match metadata, and actions to explain only what those records establish.",
+      },
       executions: [
         {
           executedRuleId: "executed-rule-1",
@@ -1764,6 +1889,104 @@ describe("aiProcessAssistantChat", () => {
           actions: [],
         },
       ],
+    });
+  });
+
+  it("marks an empty rule execution history as missing evidence", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-without-history",
+    });
+
+    expect(result).toEqual({
+      messageId: "message-without-history",
+      threadId: null,
+      evidence: {
+        state: "NO_EXECUTION_RECORDS",
+        rootCauseKnown: false,
+        summary:
+          "No execution records were found. This is missing evidence, not proof that processing never ran or of why a rule did not match.",
+      },
+      executions: [],
+    });
+  });
+
+  it("marks ambiguous skipped execution history as inconclusive", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([
+      {
+        id: "executed-rule-fallback",
+        ruleId: null,
+        threadId: "thread-fallback",
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        status: "SKIPPED",
+        reason: "No rules matched.",
+        matchMetadata: null,
+        automated: true,
+        actionItems: [],
+        rule: null,
+      },
+    ]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-fallback",
+    });
+
+    expect(result).toMatchObject({
+      messageId: "message-fallback",
+      threadId: "thread-fallback",
+      evidence: {
+        state: "INCONCLUSIVE_SKIPPED_RECORDS",
+        rootCauseKnown: false,
+        summary:
+          "Only inconclusive skipped execution records were found. They do not establish whether a specific rule matched, was later deleted, or why processing was skipped.",
+      },
+    });
+  });
+
+  it("keeps applied execution evidence when the original rule is unavailable", async () => {
+    const tools = await captureToolSet(true, "google");
+
+    mockPrisma.executedRule.findMany.mockResolvedValue([
+      {
+        id: "executed-rule-deleted",
+        ruleId: null,
+        threadId: "thread-deleted-rule",
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        status: "APPLIED",
+        reason: "The rule applied before its configuration was removed.",
+        matchMetadata: [{ type: "STATIC" }],
+        automated: true,
+        actionItems: [
+          {
+            type: "LABEL",
+            label: "Handled",
+            labelId: "label-handled",
+            subject: null,
+            to: null,
+            cc: null,
+            bcc: null,
+            url: null,
+            folderName: null,
+          },
+        ],
+        rule: null,
+      },
+    ]);
+
+    const result = await tools.getRuleExecutionForMessage.execute({
+      messageId: "message-deleted-rule",
+    });
+
+    expect(result).toMatchObject({
+      evidence: {
+        state: "RECORDED_EXECUTIONS",
+        rootCauseKnown: null,
+      },
     });
   });
 
@@ -1829,6 +2052,7 @@ describe("aiProcessAssistantChat", () => {
 
     expect(result).toEqual({
       actionType: "send_email",
+      emailAccountId: "email-account-id",
       confirmationState: "pending",
       pendingAction: {
         to: "recipient@example.test",
@@ -1846,7 +2070,10 @@ describe("aiProcessAssistantChat", () => {
     expect(sendEmailWithHtml).not.toHaveBeenCalled();
   });
 
-  it("rejects unsupported from field in chat send params", async () => {
+  it.each([
+    "from",
+    "emailAccountId",
+  ])("rejects caller-supplied %s in chat send params", async (field) => {
     const tools = await captureToolSet(true, "google");
     mockCreateEmailProvider.mockResolvedValue({
       sendEmailWithHtml: vi.fn(),
@@ -1855,13 +2082,13 @@ describe("aiProcessAssistantChat", () => {
 
     const result = await tools.sendEmail.execute({
       to: "recipient@example.test",
-      from: "sender.alias@example.test",
+      [field]: "untrusted-mailbox",
       subject: "Subject line",
       messageHtml: "<p>Hello</p>",
     } as any);
 
     expect(result).toEqual({
-      error: 'Invalid sendEmail input: unsupported field "from"',
+      error: `Invalid sendEmail input: unsupported field "${field}"`,
     });
     expect(mockCreateEmailProvider).toHaveBeenCalledTimes(providerCallsBefore);
   });
@@ -1904,6 +2131,7 @@ describe("aiProcessAssistantChat", () => {
 
     expect(result).toEqual({
       actionType: "send_email",
+      emailAccountId: "email-account-id",
       confirmationState: "pending",
       pendingAction: {
         to: "recipient@example.test",
@@ -1941,6 +2169,7 @@ describe("aiProcessAssistantChat", () => {
 
     expect(result).toEqual({
       actionType: "forward_email",
+      emailAccountId: "email-account-id",
       confirmationState: "pending",
       pendingAction: {
         messageId: "message-1",
@@ -2387,7 +2616,7 @@ describe("aiProcessAssistantChat", () => {
     });
     expect(mockUnsubscribeSenderAndMark).toHaveBeenCalledWith(
       expect.objectContaining({
-        newsletterEmail: "sender@example.com",
+        senderEmail: "sender@example.com",
         listUnsubscribeHeader: "<https://example.com/unsubscribe?id=1>",
       }),
     );

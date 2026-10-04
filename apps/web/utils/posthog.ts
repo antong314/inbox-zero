@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import { PostHog } from "posthog-node";
 import type { Properties } from "posthog-js";
 import { env } from "@/env";
@@ -25,6 +26,43 @@ export function getPosthogLlmClient() {
   }
 
   return posthogLlmClient;
+}
+
+const FEATURE_FLAG_TIMEOUT_MS = 2000;
+
+// Server-side experiment lookup. Keyed by the same distinct id the browser
+// identifies with (the user's email) so assignment and exposure line up with
+// client-side flag calls. Falls back to undefined on any failure or timeout so
+// a PostHog outage never blocks a page. The exposure event is flushed after
+// the response, since a redirect would otherwise end the request before the
+// client's background send completes.
+export async function getServerFeatureFlagVariant({
+  key,
+  distinctId,
+}: {
+  key: string;
+  distinctId: string;
+}): Promise<string | undefined> {
+  const client = getPosthogLlmClient();
+  if (!client) return;
+
+  try {
+    const variant = await Promise.race([
+      client.getFeatureFlag(key, distinctId),
+      new Promise<undefined>((resolve) =>
+        setTimeout(resolve, FEATURE_FLAG_TIMEOUT_MS),
+      ),
+    ]);
+    after(() =>
+      client.flush().catch((error) => {
+        logger.warn("Failed to flush feature flag exposure", { key, error });
+      }),
+    );
+    return typeof variant === "string" ? variant : undefined;
+  } catch (error) {
+    logger.warn("Failed to evaluate feature flag", { key, error });
+    return;
+  }
 }
 
 export function isPosthogLlmEvalApproved(email: string) {
@@ -139,7 +177,7 @@ export async function posthogCaptureEvent(
   try {
     if (!env.NEXT_PUBLIC_POSTHOG_KEY) {
       logger.warn("NEXT_PUBLIC_POSTHOG_KEY not set");
-      return;
+      return false;
     }
 
     const client = new PostHog(env.NEXT_PUBLIC_POSTHOG_KEY);
@@ -149,9 +187,21 @@ export async function posthogCaptureEvent(
       properties,
       sendFeatureFlags,
     });
-    await client.shutdown();
+    try {
+      await client.flush();
+      return true;
+    } finally {
+      try {
+        Promise.resolve(client.shutdown()).catch((error) => {
+          logger.error("Error shutting down PostHog client", { error });
+        });
+      } catch (error) {
+        logger.error("Error shutting down PostHog client", { error });
+      }
+    }
   } catch (error) {
     logger.error("Error capturing PostHog event", { error });
+    return false;
   }
 }
 
@@ -182,9 +232,48 @@ export async function trackStripeCustomerCreated(
 
 export async function trackStripeCheckoutCreated(
   email: string,
+  checkoutSessionId: string,
   properties?: Properties,
 ) {
-  return posthogCaptureEvent(email, "Stripe checkout created", properties);
+  const checkoutProperties = {
+    ...properties,
+    checkoutSessionIdHash: getCheckoutSessionIdHash(checkoutSessionId),
+  };
+  const dedupeKey = `posthog:stripe-checkout-created:${checkoutSessionId}`;
+  let firstCapture: string | null;
+
+  try {
+    firstCapture = await redis.set(dedupeKey, "1", {
+      nx: true,
+      ex: 172_800,
+    });
+  } catch (error) {
+    logger.error("Error deduplicating Stripe checkout creation event", {
+      error,
+    });
+    return posthogCaptureEvent(
+      email,
+      "Stripe checkout created",
+      checkoutProperties,
+    );
+  }
+
+  if (!firstCapture) return;
+
+  const captured = await posthogCaptureEvent(
+    email,
+    "Stripe checkout created",
+    checkoutProperties,
+  );
+  if (captured) return;
+
+  try {
+    await redis.del(dedupeKey);
+  } catch (error) {
+    logger.error("Error releasing Stripe checkout creation event lock", {
+      error,
+    });
+  }
 }
 
 export async function trackStripeCheckoutCompleted(
@@ -192,6 +281,10 @@ export async function trackStripeCheckoutCompleted(
   properties?: Properties,
 ) {
   return posthogCaptureEvent(email, "Stripe checkout completed", properties);
+}
+
+export function getCheckoutSessionIdHash(checkoutSessionId: string) {
+  return hash(checkoutSessionId);
 }
 
 export async function trackError({
@@ -263,6 +356,31 @@ export async function trackBillingTrialStarted(
       premiumStatus: "on_trial",
     },
   });
+}
+
+export async function trackBillingTrialConverted(
+  email: string,
+  attributes: Properties,
+) {
+  return posthogCaptureEvent(email, "billing_trial_converted", {
+    ...attributes,
+    $set: {
+      premium: true,
+      premiumTier: "subscription",
+      premiumStatus: "active",
+    },
+  });
+}
+
+export async function trackBillingCancellationInitiated(
+  email: string,
+  attributes: Properties,
+) {
+  return posthogCaptureEvent(
+    email,
+    "billing_cancellation_initiated",
+    attributes,
+  );
 }
 
 export async function trackSubscriptionCustom(

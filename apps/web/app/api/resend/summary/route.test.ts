@@ -14,14 +14,12 @@ vi.mock("@/utils/prisma");
 const {
   mockCreateEmailProvider,
   mockCreateUnsubscribeToken,
-  mockHasCronSecret,
-  mockIsValidInternalApiKey,
+  mockIsAuthorizedCronOrInternalRequest,
   mockSendSummaryEmail,
 } = vi.hoisted(() => ({
   mockCreateEmailProvider: vi.fn(),
   mockCreateUnsubscribeToken: vi.fn(),
-  mockHasCronSecret: vi.fn(),
-  mockIsValidInternalApiKey: vi.fn(),
+  mockIsAuthorizedCronOrInternalRequest: vi.fn(),
   mockSendSummaryEmail: vi.fn(),
 }));
 
@@ -46,12 +44,8 @@ vi.mock("@/utils/middleware", async () => {
 });
 
 vi.mock("@/utils/cron", () => ({
-  hasCronSecret: (...args: unknown[]) => mockHasCronSecret(...args),
-}));
-
-vi.mock("@/utils/internal-api", () => ({
-  isValidInternalApiKey: (...args: unknown[]) =>
-    mockIsValidInternalApiKey(...args),
+  isAuthorizedCronOrInternalRequest: (...args: unknown[]) =>
+    mockIsAuthorizedCronOrInternalRequest(...args),
 }));
 
 vi.mock("@/utils/email/provider", () => ({
@@ -63,7 +57,7 @@ vi.mock("@/utils/unsubscribe", () => ({
     mockCreateUnsubscribeToken(...args),
 }));
 
-vi.mock("@inboxzero/resend", () => ({
+vi.mock("@inboxzero/transactional-email", () => ({
   sendSummaryEmail: (...args: unknown[]) => mockSendSummaryEmail(...args),
 }));
 
@@ -72,8 +66,7 @@ import { POST } from "./route";
 describe("summary email route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockHasCronSecret.mockReturnValue(true);
-    mockIsValidInternalApiKey.mockReturnValue(false);
+    mockIsAuthorizedCronOrInternalRequest.mockReturnValue(true);
     mockCreateUnsubscribeToken.mockResolvedValue("unsubscribe-token");
     mockSendSummaryEmail.mockResolvedValue(undefined);
   });
@@ -106,10 +99,6 @@ describe("summary email route", () => {
         },
       });
     prisma.rule.findUnique.mockResolvedValue(null);
-    prisma.threadTracker.groupBy.mockResolvedValue([]);
-    prisma.threadTracker.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
     prisma.executedAction.count.mockResolvedValue(2);
     prisma.executedAction.findMany.mockResolvedValue([
       {
@@ -140,6 +129,9 @@ describe("summary email route", () => {
     );
 
     expect(response.status).toBe(200);
+    expect(mockIsAuthorizedCronOrInternalRequest).toHaveBeenCalledWith(
+      expect.any(Request),
+    );
     expect(mockCreateEmailProvider).toHaveBeenCalledWith(
       expect.objectContaining({
         emailAccountId: "email-account-id",
@@ -161,12 +153,18 @@ describe("summary email route", () => {
             subject: "Product update",
             sentAt: archivedAt,
             ruleName: "Marketing",
+            url: "https://mail.google.com/mail/u/?authuser=user%40example.com#all/archived-message-1",
+            senderUrl:
+              "https://mail.google.com/mail/u/?authuser=user%40example.com#advanced-search/from=marketing%40example.com",
           },
           {
             from: "Newsletter <newsletter@example.com>",
             subject: "Newsletter snippet",
             sentAt: archivedAt,
             ruleName: "Newsletter",
+            url: "https://mail.google.com/mail/u/?authuser=user%40example.com#all/archived-message-2",
+            senderUrl:
+              "https://mail.google.com/mail/u/?authuser=user%40example.com#advanced-search/from=newsletter%40example.com",
           },
         ],
         coldEmailers: [],
@@ -191,10 +189,6 @@ describe("summary email route", () => {
         },
       });
     prisma.rule.findUnique.mockResolvedValue(null);
-    prisma.threadTracker.groupBy.mockResolvedValue([]);
-    prisma.threadTracker.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
     prisma.executedAction.count.mockResolvedValue(0);
     prisma.executedAction.findMany.mockResolvedValue([]);
     prisma.emailAccount.update.mockResolvedValue({});
@@ -225,10 +219,6 @@ describe("summary email route", () => {
         },
       });
     prisma.rule.findUnique.mockResolvedValue(null);
-    prisma.threadTracker.groupBy.mockResolvedValue([]);
-    prisma.threadTracker.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
     prisma.executedAction.count.mockResolvedValue(1);
     prisma.executedAction.findMany.mockResolvedValue([
       {
@@ -261,6 +251,63 @@ describe("summary email route", () => {
     });
   });
 
+  it("reports the full cold email count while fetching only the most recent ones", async () => {
+    const blockedAt = new Date("2026-06-28T12:00:00.000Z");
+    const getMessagesBatch = vi.fn().mockResolvedValue([
+      getMessage({
+        id: "cold-message-1",
+        from: "Sales <sales@example.com>",
+        subject: "Quick question",
+        snippet: "Quick question snippet",
+      }),
+    ]);
+
+    prisma.emailAccount.findUnique
+      .mockResolvedValueOnce({ lastSummaryEmailAt: null })
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        email: "user@example.com",
+        account: {
+          provider: "google",
+          refresh_token: "refresh-token",
+        },
+      });
+    prisma.rule.findUnique.mockResolvedValue({ id: "cold-rule-id" });
+    prisma.executedRule.count.mockResolvedValue(250);
+    prisma.executedRule.findMany.mockResolvedValue([
+      { messageId: "cold-message-1", createdAt: blockedAt },
+    ]);
+    prisma.executedAction.count.mockResolvedValue(0);
+    prisma.executedAction.findMany.mockResolvedValue([]);
+    prisma.emailAccount.update.mockResolvedValue({});
+    mockCreateEmailProvider.mockResolvedValue({ getMessagesBatch });
+
+    const response = await POST(
+      new NextRequest("http://localhost:3000/api/resend/summary", {
+        method: "POST",
+        body: JSON.stringify({ emailAccountId: "email-account-id" }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(prisma.executedRule.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 100 }),
+    );
+    expect(mockSendSummaryEmail).toHaveBeenCalledWith({
+      from: expect.any(String),
+      to: "user@example.com",
+      emailProps: expect.objectContaining({
+        coldEmailCount: 250,
+        coldEmailers: [
+          expect.objectContaining({
+            from: "Sales <sales@example.com>",
+            sentAt: blockedAt,
+          }),
+        ],
+      }),
+    });
+  });
+
   it("counts only completed archive actions in the weekly archive summary query", async () => {
     prisma.emailAccount.findUnique
       .mockResolvedValueOnce({ lastSummaryEmailAt: null })
@@ -273,10 +320,6 @@ describe("summary email route", () => {
         },
       });
     prisma.rule.findUnique.mockResolvedValue(null);
-    prisma.threadTracker.groupBy.mockResolvedValue([]);
-    prisma.threadTracker.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
     prisma.executedAction.count.mockResolvedValue(0);
     prisma.executedAction.findMany.mockResolvedValue([]);
     prisma.emailAccount.update.mockResolvedValue({});

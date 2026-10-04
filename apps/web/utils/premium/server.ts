@@ -1,6 +1,8 @@
 import { after } from "next/server";
 import prisma from "@/utils/prisma";
-import { ActionType, type PremiumTier } from "@/generated/prisma/enums";
+import type { ActionType } from "@/generated/prisma/enums";
+import { PremiumTier } from "@/generated/prisma/enums";
+import { ONE_MONTH_MS, ONE_YEAR_MS, TEN_YEARS_MS } from "@/utils/date";
 import { createScopedLogger } from "@/utils/logger";
 import { ensureEmailAccountsWatched } from "@/utils/email/watch-manager";
 import {
@@ -11,6 +13,7 @@ import {
 } from "@/utils/premium";
 import { SafeError } from "@/utils/error";
 import { env } from "@/env";
+import { isAddingDigestAction } from "@/utils/premium/digest";
 
 const logger = createScopedLogger("premium");
 
@@ -137,6 +140,63 @@ export async function grantPremiumAdmin(options: {
   return premiumRecord;
 }
 
+export async function applyPendingPremiumGrant({
+  userId,
+  email,
+}: {
+  userId: string;
+  email: string;
+}) {
+  const grant = await prisma.pendingPremiumGrant.findUnique({
+    where: { email: email.trim().toLowerCase() },
+  });
+  if (!grant) return;
+
+  // Claim before granting so a grant is never applied twice or left behind.
+  const { count: claimed } = await prisma.pendingPremiumGrant.deleteMany({
+    where: { id: grant.id },
+  });
+  if (!claimed) return;
+
+  await grantPremiumAdmin({
+    userId,
+    tier: grant.tier,
+    adminGrantExpiresAt: getAdminGrantExpiresAt(grant),
+    emailAccountsAccess: grant.emailAccountsAccess ?? undefined,
+  });
+
+  logger.info("Applied pending premium grant", { userId });
+}
+
+export function getAdminGrantExpiresAt({
+  tier,
+  count,
+}: {
+  tier: PremiumTier;
+  count?: number;
+}): Date | null {
+  const now = Date.now();
+  switch (tier) {
+    case PremiumTier.BASIC_ANNUALLY:
+    case PremiumTier.PRO_ANNUALLY:
+    case PremiumTier.STARTER_ANNUALLY:
+    case PremiumTier.PLUS_ANNUALLY:
+    case PremiumTier.PROFESSIONAL_ANNUALLY:
+      return new Date(now + ONE_YEAR_MS * (count || 1));
+    case PremiumTier.BASIC_MONTHLY:
+    case PremiumTier.PRO_MONTHLY:
+    case PremiumTier.STARTER_MONTHLY:
+    case PremiumTier.PLUS_MONTHLY:
+    case PremiumTier.PROFESSIONAL_MONTHLY:
+    case PremiumTier.COPILOT_MONTHLY:
+      return new Date(now + ONE_MONTH_MS * (count || 1));
+    case PremiumTier.LIFETIME:
+      return new Date(now + TEN_YEARS_MS);
+    default:
+      return null;
+  }
+}
+
 export async function cancelPremiumLemon({
   premiumId,
   lemonSqueezyEndsAt,
@@ -178,10 +238,13 @@ export async function assertCanUseDigests(userId: string) {
 export async function assertCanUseDigestsIfNeeded(
   userId: string,
   actions: { type: ActionType }[],
+  existingActions?: { type: ActionType }[],
 ) {
-  if (actions.some((action) => action.type === ActionType.DIGEST)) {
-    await assertCanUseDigests(userId);
+  if (!isAddingDigestAction({ requestedActions: actions, existingActions })) {
+    return;
   }
+
+  await assertCanUseDigests(userId);
 }
 
 export async function checkHasAccess({

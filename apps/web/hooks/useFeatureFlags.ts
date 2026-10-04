@@ -3,6 +3,10 @@ import {
   useFeatureFlagVariantKey,
 } from "posthog-js/react";
 import { env } from "@/env";
+import {
+  INTEGRATION_ACTION_FEATURE_FLAG,
+  isIntegrationActionGloballyEnabled,
+} from "@/utils/integration-action";
 
 export function useCleanerEnabled() {
   const posthogEnabled = useFeatureFlagEnabled("inbox-cleaner");
@@ -18,9 +22,21 @@ export function useMeetingBriefsEnabled() {
   return env.NEXT_PUBLIC_MEETING_BRIEFS_ENABLED;
 }
 
-export function useIntegrationsEnabled() {
+export function useMeetingRecorderEnabled() {
+  return env.NEXT_PUBLIC_MEETING_RECORDER_ENABLED;
+}
+
+// Returns undefined while the PostHog flag is still loading
+export function useIntegrationsEnabled(): boolean | undefined {
   const posthogEnabled = useFeatureFlagEnabled("integrations");
-  return env.NEXT_PUBLIC_INTEGRATIONS_ENABLED || posthogEnabled;
+  if (env.NEXT_PUBLIC_INTEGRATIONS_ENABLED) return true;
+  if (!env.NEXT_PUBLIC_POSTHOG_KEY) return false;
+  return posthogEnabled;
+}
+
+export function useIntegrationActionsEnabled(): boolean {
+  const posthogEnabled = useFeatureFlagEnabled(INTEGRATION_ACTION_FEATURE_FLAG);
+  return isIntegrationActionGloballyEnabled() || posthogEnabled === true;
 }
 
 export function useSmartFilingEnabled() {
@@ -34,70 +50,16 @@ export function useBookingLinksEnabled() {
 }
 
 export function useTeamsEnabled() {
-  return useFeatureFlagEnabled("microsoft-teams");
+  const posthogEnabled = useFeatureFlagEnabled("microsoft-teams");
+  return env.NEXT_PUBLIC_TEAMS_ENABLED || posthogEnabled;
 }
 
-const HERO_FLAG_NAME = "hero-copy-7";
+export type PricingFrequencyDefault = "control" | "monthly" | "annually";
 
-export type HeroVariant = "control" | "clean-up-in-minutes";
-
-export function useHeroVariant() {
-  return (useFeatureFlagVariantKey(HERO_FLAG_NAME) as HeroVariant) || "control";
-}
-
-export function useHeroVariantEnabled() {
-  return useFeatureFlagEnabled(HERO_FLAG_NAME);
-}
-
-export type PricingVariant = "control" | "basic-business" | "business-basic";
-
-export function usePricingVariant() {
-  return (
-    (useFeatureFlagVariantKey("pricing-options-2") as PricingVariant) ||
-    "control"
-  );
-}
-
-export type PricingFrequencyDefault = "control" | "monthly";
-
-export function usePricingFrequencyDefault() {
-  return (
-    (useFeatureFlagVariantKey(
-      "pricing-frequency-default",
-    ) as PricingFrequencyDefault) || "control"
-  );
-}
-
-export type TestimonialsVariant = "control" | "senja-widget";
-
-export function useTestimonialsVariant() {
-  return (
-    (useFeatureFlagVariantKey("testimonials") as TestimonialsVariant) ||
-    "control"
-  );
-}
-
-export type WelcomePricingVariant = "control" | "two-tiers";
-
-export function useWelcomePricingVariant() {
-  return (
-    (useFeatureFlagVariantKey(
-      "welcome-pricing-tiers",
-    ) as WelcomePricingVariant) || "control"
-  );
-}
-
-export type OnboardingBulkUnsubscribeVariant = "control" | "inline-unsubscribe";
-
-// A/B test for the onboarding bulk-unsubscribe step: "control" shows the
-// static marketing slide, "inline-unsubscribe" shows the personalized,
-// actionable list. Reading the flag here is the experiment exposure
-// ($feature_flag_called). Defaults to control until the flag resolves and when
-// PostHog is unavailable (e.g. self-hosted), preserving the existing step.
-export function useOnboardingBulkUnsubscribeVariant() {
-  return (
-    (useFeatureFlagVariantKey(
-      "onboarding-bulk-unsubscribe",
-    ) as OnboardingBulkUnsubscribeVariant) || "control"
-  );
+export function usePricingFrequencyDefault():
+  | PricingFrequencyDefault
+  | undefined {
+  return useFeatureFlagVariantKey("pricing-frequency-default") as
+    | PricingFrequencyDefault
+    | undefined;
 }

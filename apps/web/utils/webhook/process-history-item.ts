@@ -7,10 +7,8 @@ import {
   isFilebotNotificationMessage,
 } from "@/utils/filebot/is-filebot-email";
 import { processFilingReply } from "@/utils/drive/handle-filing-reply";
-import {
-  processAttachment,
-  getFilableAttachments,
-} from "@/utils/drive/filing-engine";
+import { getFilableAttachments } from "@/utils/drive/filing-engine";
+import { processAttachmentsForFiling } from "@/utils/drive/process-filing-attachments";
 import { handleOutboundMessage } from "@/utils/reply-tracker/handle-outbound";
 import { cleanupThreadAIDrafts } from "@/utils/reply-tracker/draft-tracking";
 import { clearFollowUpLabel } from "@/utils/follow-up/labels";
@@ -23,8 +21,10 @@ import type { ParsedMessage, RuleWithActions } from "@/utils/types";
 import type { EmailAccountForDrafting } from "@/utils/ai/choose-rule/choose-args";
 import type { Logger } from "@/utils/logger";
 import { runWithBackgroundLoggerFlush } from "@/utils/logger-flush";
-import { captureException } from "@/utils/error";
+import { captureException, SafeError } from "@/utils/error";
 import { logErrorWithDedupe } from "@/utils/log-error-with-dedupe";
+import { sendOtpPushNotification } from "@/utils/otp-push";
+import { internalDateToDate } from "@/utils/date";
 
 export type SharedProcessHistoryOptions = {
   provider: EmailProvider;
@@ -158,8 +158,27 @@ export async function processHistoryItem(
 
     if (sender) {
       await provider.blockUnsubscribedEmail(messageId);
-      logger.info("Skipping. Blocked unsubscribed email.", { from: email });
+      const receivedAt = internalDateToDate(parsedMessage.internalDate, {
+        fallbackToNow: false,
+      });
+      logger.info("Skipping. Blocked unsubscribed email.", {
+        senderId: sender.id,
+        receivedAt: Number.isFinite(receivedAt.getTime())
+          ? receivedAt.toISOString()
+          : null,
+      });
       return;
+    }
+
+    try {
+      await sendOtpPushNotification({
+        emailAccountId,
+        userId: emailAccount.userId,
+        message: parsedMessage,
+        logger,
+      });
+    } catch (error) {
+      logger.warn("OTP push notification processing failed", { error });
     }
 
     if (!hasAiAccess) {
@@ -230,28 +249,20 @@ export async function processHistoryItem(
                 count: extractableAttachments.length,
               });
 
-              // Process each attachment (don't await all - let them run in background)
-              for (const attachment of extractableAttachments) {
-                await processAttachment({
-                  emailAccount: {
-                    ...emailAccount,
-                    filingEnabled: emailAccount.filingEnabled,
-                    filingPrompt: emailAccount.filingPrompt,
-                    filingConfirmationSendEmail:
-                      emailAccount.filingConfirmationSendEmail,
-                    email: emailAccount.email,
-                  },
-                  message: parsedMessage,
-                  attachment,
-                  emailProvider: provider,
-                  logger,
-                }).catch((error) => {
-                  logger.error("Failed to process attachment", {
-                    filename: attachment.filename,
-                    error,
-                  });
-                });
-              }
+              await processAttachmentsForFiling({
+                attachments: extractableAttachments,
+                emailAccount: {
+                  ...emailAccount,
+                  filingEnabled: emailAccount.filingEnabled,
+                  filingPrompt: emailAccount.filingPrompt,
+                  filingConfirmationSendEmail:
+                    emailAccount.filingConfirmationSendEmail,
+                  email: emailAccount.email,
+                },
+                message: parsedMessage,
+                emailProvider: provider,
+                logger,
+              });
             }
           },
           extra: { operation: "process-attachments" },
@@ -319,6 +330,11 @@ export async function processHistoryItem(
         logger.info("Message not found");
         return;
       }
+    }
+
+    if (error instanceof SafeError) {
+      logger.info("Skipping. Known processing error.");
+      return;
     }
 
     await logErrorWithDedupe({

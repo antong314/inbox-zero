@@ -22,7 +22,7 @@ vi.mock("@/env", () => ({
     RESEND_FROM_EMAIL: "from@example.com",
   },
 }));
-vi.mock("@inboxzero/resend", () => resendMocks);
+vi.mock("@inboxzero/transactional-email", () => resendMocks);
 
 const logger = createTestLogger();
 
@@ -112,6 +112,31 @@ describe("booking emails", () => {
     );
   });
 
+  it("tells the host when a Microsoft Teams link was not generated", async () => {
+    await sendBookingConfirmationEmails({
+      booking: bookingEmailPayload({
+        videoConferenceLink: null,
+        bookingLink: {
+          locationType: BookingLinkLocationType.MICROSOFT_TEAMS,
+          locationValue: null,
+        },
+      }),
+      guestTimezone: "UTC",
+      cancelUrl: "https://example.com/book/cancel/booking-uid?token=token",
+      rescheduleUrl:
+        "https://example.com/book/reschedule/booking-uid?token=token",
+      logger,
+    });
+
+    expect(resendMocks.sendHostBookingConfirmationEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        emailProps: expect.objectContaining({
+          location: "Microsoft Teams link was not generated",
+        }),
+      }),
+    );
+  });
+
   it("sends reschedule emails to guest and host with previous time", async () => {
     await sendBookingRescheduledEmails({
       booking: bookingEmailPayload(),
@@ -179,10 +204,8 @@ function bookingEmailPayload(
       title: "Intro call",
       locationType: BookingLinkLocationType.CUSTOM,
       locationValue: "Conference room",
-      availabilitySchedule: {
-        timezone: "UTC",
-      },
       emailAccount: {
+        timezone: "UTC",
         email: "host@example.com",
         name: "Host User",
       },

@@ -10,7 +10,7 @@ import {
   getGoogleGmailApiRootUrl,
   getGoogleOauthClientOptions,
   getGooglePeopleApiRootUrl,
-} from "@/utils/google/oauth";
+} from "@/utils/gmail/oauth";
 
 type AuthOptions = {
   accessToken?: string | null;
@@ -65,6 +65,15 @@ export const getGmailClientWithRefresh = async ({
   if (!refreshToken) {
     // expected for disconnected accounts
     logger.warn("No refresh token", { emailAccountId });
+    await cleanupInvalidTokens({
+      emailAccountId,
+      reason: "invalid_grant",
+      failedAccessToken: accessToken ?? undefined,
+      failedRefreshToken: null,
+      logger,
+    }).catch((error) =>
+      logger.warn("Failed to record missing refresh token", { error }),
+    );
     throw new SafeError("No refresh token");
   }
 
@@ -111,6 +120,8 @@ export const getGmailClientWithRefresh = async ({
         await cleanupInvalidTokens({
           emailAccountId,
           reason: "invalid_grant",
+          failedAccessToken: accessToken ?? undefined,
+          failedRefreshToken: refreshToken,
           logger,
         });
       } catch (cleanupError) {

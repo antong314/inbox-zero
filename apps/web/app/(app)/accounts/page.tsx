@@ -39,6 +39,8 @@ import {
   SCOPES as MICROSOFT_EMAIL_SCOPES,
 } from "@/utils/outlook/scopes";
 import { MICROSOFT_DRIVE_SCOPES } from "@/utils/drive/scopes";
+import { clearLocalMailAccountState } from "@/utils/mail-engine/clear-local-mail-account";
+import { clearOfflineMailCacheForAccount } from "@/utils/offline/clear-mail-cache";
 
 export default function AccountsPage() {
   const { data, isLoading, error, mutate } = useAccounts();
@@ -159,6 +161,17 @@ function AccountOptionsDropdown({
       onAccountDeleted();
       if (emailAccount.isPrimary) {
         await logOut("/login");
+      } else {
+        try {
+          await clearLocalMailAccountState(emailAccount.id);
+        } catch {
+          toastError({
+            title: "Local mailbox still on this device",
+            description:
+              "The account was deleted. Sign out to finish removing its mail from this device.",
+          });
+        }
+        await clearOfflineMailCacheForAccount(emailAccount.id);
       }
     },
     onError: (error) => {
@@ -173,7 +186,7 @@ function AccountOptionsDropdown({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon">
+        <Button variant="ghost" size="icon" aria-label="Account options">
           <MoreVertical className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
@@ -312,10 +325,24 @@ function getAccountErrorMessage(
       description: `This account is already linked to another ${BRAND_NAME} profile. Sign in to that profile, use a different email account, or contact support if you need help.`,
       toastDescription: `This account is already linked to another ${BRAND_NAME} profile. Sign in to that profile, use a different email account, or contact support if you need help.`,
     },
+    reconnect_account_mismatch: {
+      title: "Wrong account signed in",
+      description:
+        "You signed in with a different account than the one you were reconnecting. Sign out of that provider, or pick the original account, and try again.",
+      toastDescription:
+        "You signed in with a different account than the one you were reconnecting. Sign out of that provider, or pick the original account, and try again.",
+    },
     already_linked_to_self: {
       title: "Account already linked",
       description: "This account is already linked to your profile.",
       toastDescription: "This account is already linked to your profile.",
+    },
+    provider_sign_in_required: {
+      title: "Provider sign-in required",
+      description:
+        "Connecting or reconnecting a mailbox isn't available when you signed in with an email code. Sign in with Google or Microsoft and try again.",
+      toastDescription:
+        "Connecting or reconnecting a mailbox isn't available when you signed in with an email code. Sign in with Google or Microsoft and try again.",
     },
     invalid_state: {
       title: "Invalid request",

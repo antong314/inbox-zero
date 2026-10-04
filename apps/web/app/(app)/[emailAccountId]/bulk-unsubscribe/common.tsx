@@ -167,16 +167,19 @@ function UnsubscribeButton<T extends Row>({
 }) {
   const [resubscribeDialogOpen, setResubscribeDialogOpen] = useState(false);
 
-  const { unsubscribeLoading, onUnsubscribe, unsubscribeLink } = useUnsubscribe(
-    {
-      item,
-      hasUnsubscribeAccess,
-      mutate,
-      posthog,
-      refetchPremium,
-      emailAccountId,
-    },
-  );
+  const {
+    unsubscribeLoading,
+    onUnsubscribe,
+    unsubscribeLink,
+    hasAutomaticUnsubscribe,
+  } = useUnsubscribe({
+    item,
+    hasUnsubscribeAccess,
+    mutate,
+    posthog,
+    refetchPremium,
+    emailAccountId,
+  });
   const { onBulkDelete, isBulkDeleting } = useBulkDelete({
     mutate,
     posthog,
@@ -216,6 +219,19 @@ function UnsubscribeButton<T extends Row>({
         {isProcessing && <ButtonLoader />}
         Resubscribe
       </Button>
+    ) : hasAutomaticUnsubscribe ? (
+      // Unsubscribing happens here, so opening the sender's page would only
+      // hand the reader work we are about to do for them.
+      <Button
+        size="sm"
+        variant="outline"
+        className="w-[110px] justify-center"
+        onClick={onUnsubscribe}
+        disabled={unsubscribeLoading}
+      >
+        {unsubscribeLoading && <ButtonLoader />}
+        {buttonText}
+      </Button>
     ) : (
       <Button
         size="sm"
@@ -243,7 +259,7 @@ function UnsubscribeButton<T extends Row>({
         open={resubscribeDialogOpen}
         onOpenChange={setResubscribeDialogOpen}
         senderName={senderName}
-        newsletterEmail={item.name}
+        senderEmail={item.name}
         emailAccountId={emailAccountId}
         mutate={mutate}
       />

@@ -1,7 +1,10 @@
+import type { Message } from "@microsoft/microsoft-graph-types";
 import type { Logger } from "@/utils/logger";
 import type { OutlookClient } from "@/utils/outlook/client";
+import type { BulkArchiveResult, BulkArchiveThread } from "@/utils/email/types";
 import { escapeODataString } from "@/utils/outlook/odata-escape";
 import { getFolderIds } from "@/utils/outlook/message";
+import { resolveMicrosoftGraphNextLink } from "@/utils/outlook/page-token";
 import {
   publishBulkActionToTinybird,
   updateEmailMessagesForSender,
@@ -9,6 +12,8 @@ import {
 
 const GRAPH_JSON_BATCH_LIMIT = 20; // Microsoft Graph JSON batching limit
 const GRAPH_MOVE_BATCH_LIMIT = 4;
+const THREAD_PARTICIPANT_SELECT_FIELDS =
+  "id,conversationId,from,toRecipients,receivedDateTime";
 
 type GraphBatchRequestItem<TBody = unknown> = {
   id: string;
@@ -39,6 +44,7 @@ async function batch<TRequestBody = unknown, TResponseBody = unknown>({
   requests,
   chunkSize,
   onFailure,
+  shouldStop,
   context,
   logger,
 }: {
@@ -49,6 +55,7 @@ async function batch<TRequestBody = unknown, TResponseBody = unknown>({
     request?: GraphBatchRequestItem<TRequestBody>;
     response: GraphBatchResponseItem<TResponseBody>;
   }) => void;
+  shouldStop?: (responses: GraphBatchResponseItem<TResponseBody>[]) => boolean;
   context?: Record<string, unknown>;
   logger: Logger;
 }): Promise<GraphBatchResponseItem<TResponseBody>[]> {
@@ -83,6 +90,7 @@ async function batch<TRequestBody = unknown, TResponseBody = unknown>({
           });
         }
       });
+      if (shouldStop?.(responses)) break;
     } catch (error) {
       logger.error("Graph batch request failed", {
         ...context,
@@ -94,6 +102,86 @@ async function batch<TRequestBody = unknown, TResponseBody = unknown>({
   }
 
   return aggregatedResponses;
+}
+
+export async function getThreadParticipantMessagesInBatches({
+  client,
+  threadIds,
+  logger,
+}: {
+  client: OutlookClient;
+  threadIds: string[];
+  logger: Logger;
+}): Promise<Map<string, Message[]>> {
+  const requestIdToThreadId = new Map<string, string>();
+  let requests = threadIds.map((threadId, index) => {
+    const requestId = `thread-${index}`;
+    requestIdToThreadId.set(requestId, threadId);
+
+    const searchParams = new URLSearchParams({
+      // Unsent drafts would otherwise appear as senders in thread names.
+      $filter: `conversationId eq '${escapeODataString(threadId)}' and isDraft eq false`,
+      $select: THREAD_PARTICIPANT_SELECT_FIELDS,
+      $top: "100",
+    });
+
+    return {
+      id: requestId,
+      method: "GET",
+      url: `/me/messages?${searchParams}`,
+    };
+  });
+
+  const messagesByThreadId = new Map<string, Message[]>();
+  const seenNextLinks = new Set<string>();
+
+  while (requests.length) {
+    const responses = await batch<
+      never,
+      { value?: Message[]; "@odata.nextLink"?: string }
+    >({
+      client,
+      requests,
+      logger,
+      context: { threadCount: threadIds.length },
+      onFailure: ({ request, response }) => {
+        logger.warn("Failed to fetch Outlook thread participants", {
+          threadId: request ? requestIdToThreadId.get(request.id) : undefined,
+          status: response.status,
+        });
+      },
+      shouldStop: (responses) =>
+        responses.some((response) => response.status === 429),
+    });
+    const continuationRequests: typeof requests = [];
+
+    for (const response of responses) {
+      if (response.status >= 400) continue;
+
+      const threadId = requestIdToThreadId.get(response.id);
+      if (!threadId) continue;
+
+      const messages = messagesByThreadId.get(threadId) ?? [];
+      messages.push(...(response.body?.value ?? []));
+      messagesByThreadId.set(threadId, messages);
+
+      const nextLink = response.body?.["@odata.nextLink"];
+      if (!nextLink || seenNextLinks.has(nextLink)) continue;
+
+      seenNextLinks.add(nextLink);
+      continuationRequests.push({
+        id: response.id,
+        method: "GET",
+        url: toGraphBatchUrl(nextLink),
+      });
+    }
+
+    if (responses.some((response) => response.status === 429)) break;
+
+    requests = continuationRequests;
+  }
+
+  return messagesByThreadId;
 }
 
 async function moveMessagesInBatches({
@@ -165,6 +253,8 @@ async function moveMessagesInBatches({
         logger.error("Failed to move message via batch", context);
       }
     },
+    shouldStop: (responses) =>
+      responses.some((response) => response.status === 429),
   });
 
   const movedMessageIds = responses.flatMap((response) => {
@@ -191,6 +281,55 @@ async function moveMessagesInBatches({
     movedMessageIds,
     hasErrors,
   };
+}
+
+export async function moveThreadsInBatches({
+  client,
+  threads,
+  destinationId,
+  ownerEmail,
+  logger,
+}: {
+  client: OutlookClient;
+  threads: BulkArchiveThread[];
+  destinationId: string;
+  ownerEmail: string;
+  logger: Logger;
+}): Promise<BulkArchiveResult> {
+  const messageIds = [
+    ...new Set(threads.flatMap((thread) => thread.messageIds)),
+  ];
+  const { movedMessageIds } = await moveMessagesInBatches({
+    client,
+    messageIds,
+    destinationId,
+    action: "archive",
+    logger,
+  });
+  const movedMessageIdSet = new Set(movedMessageIds);
+  const succeededThreadIds = threads
+    .filter(
+      (thread) =>
+        thread.messageIds.length > 0 &&
+        thread.messageIds.every((messageId) =>
+          movedMessageIdSet.has(messageId),
+        ),
+    )
+    .map((thread) => thread.threadId);
+  const succeededThreadIdSet = new Set(succeededThreadIds);
+  const failedThreadIds = threads
+    .map((thread) => thread.threadId)
+    .filter((threadId) => !succeededThreadIdSet.has(threadId));
+
+  if (succeededThreadIds.length > 0) {
+    await publishBulkActionToTinybird({
+      threadIds: succeededThreadIds,
+      action: "archive",
+      ownerEmail,
+    });
+  }
+
+  return { succeededThreadIds, failedThreadIds };
 }
 
 export async function moveMessagesForSenders({
@@ -373,4 +512,15 @@ export async function moveMessagesForSenders({
   }
 
   return movedMessagesCount;
+}
+
+function toGraphBatchUrl(nextLink: string): string {
+  const resolvedNextLink = resolveMicrosoftGraphNextLink(nextLink);
+  if (!resolvedNextLink) {
+    throw new Error("Invalid Outlook participant page token");
+  }
+
+  const url = new URL(resolvedNextLink);
+  const pathname = url.pathname.replace(/^\/(?:v1\.0|beta)(?=\/)/, "");
+  return `${pathname}${url.search}`;
 }

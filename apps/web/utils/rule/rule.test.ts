@@ -3,23 +3,27 @@ import prisma from "@/utils/__mocks__/prisma";
 import { ActionType, GroupItemType } from "@/generated/prisma/enums";
 import { createEmailProvider } from "@/utils/email/provider";
 import { DELETE_EMAIL_ACTION_DISABLED_MESSAGE } from "@/utils/delete-email-action";
-import { WEBHOOK_ACTION_DISABLED_MESSAGE } from "@/utils/webhook-action";
+import { WEBHOOK_ACTION_DISABLED_MESSAGE } from "@/utils/outbound-webhook/action";
 import { getActionRiskLevel } from "@/utils/risk";
 
-const { createRuleHistoryMock, mockEnv } = vi.hoisted(() => ({
+const {
+  createRuleHistoryMock,
+  mockEnv,
+  mockIsIntegrationActionEnabledForEmailAccountId,
+} = vi.hoisted(() => ({
   createRuleHistoryMock: vi.fn(),
   mockEnv: {
     webhookActionsEnabled: true,
     deleteEmailActionEnabled: true,
   },
+  mockIsIntegrationActionEnabledForEmailAccountId: vi
+    .fn()
+    .mockResolvedValue(true),
 }));
 
 vi.mock("@/utils/prisma");
 vi.mock("@/utils/risk", () => ({
   getActionRiskLevel: vi.fn(),
-}));
-vi.mock("@/app/(app)/[emailAccountId]/assistant/examples", () => ({
-  hasExampleParams: vi.fn(() => false),
 }));
 vi.mock("@/utils/rule/rule-history", () => ({
   createRuleHistory: createRuleHistoryMock,
@@ -30,6 +34,10 @@ vi.mock("@/utils/email/provider-types", () => ({
 }));
 vi.mock("@/utils/email/provider", () => ({
   createEmailProvider: vi.fn(),
+}));
+vi.mock("@/utils/integration-action.server", () => ({
+  isIntegrationActionEnabledForEmailAccountId:
+    mockIsIntegrationActionEnabledForEmailAccountId,
 }));
 vi.mock("@/utils/label/resolve-label", () => ({
   resolveLabelNameAndId: vi.fn(),
@@ -60,7 +68,6 @@ import {
   setRuleEnabled,
   setRuleRunOnThreads,
   updateRule,
-  updateRuleInstructions,
   updateRuleActions,
 } from "./rule";
 import { createTestLogger } from "@/__tests__/helpers";
@@ -647,17 +654,6 @@ describe("rule history snapshots", () => {
 
   it.each([
     {
-      name: "updating instructions",
-      data: { instructions: "updated instructions" },
-      triggerType: "instructions_updated",
-      run: () =>
-        updateRuleInstructions({
-          ruleId: RULE_ID,
-          emailAccountId: EMAIL_ACCOUNT_ID,
-          instructions: "updated instructions",
-        }),
-    },
-    {
       name: "toggling rule enablement",
       data: { enabled: false },
       triggerType: "enabled_updated",
@@ -791,6 +787,57 @@ describe("webhook URL validation at save time", () => {
   });
 });
 
+describe("integration action access", () => {
+  beforeEach(() => {
+    resetRuleMocks();
+    mockIsIntegrationActionEnabledForEmailAccountId.mockResolvedValue(true);
+    prisma.rule.findFirst.mockResolvedValue({
+      from: null,
+      actions: [],
+    } as never);
+    prisma.mcpConnection.findMany.mockResolvedValue([
+      { integration: { name: "todoist" } },
+    ] as never);
+    prisma.rule.update.mockResolvedValue({
+      id: RULE_ID,
+      actions: [],
+      group: null,
+    } as never);
+  });
+
+  it("checks access once when updating integration actions", async () => {
+    await updateRuleActions({
+      ruleId: RULE_ID,
+      actions: [integrationAction()],
+      provider: "gmail",
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      logger,
+    });
+
+    expect(
+      mockIsIntegrationActionEnabledForEmailAccountId,
+    ).toHaveBeenCalledOnce();
+    expect(prisma.rule.update).toHaveBeenCalled();
+  });
+
+  it("rejects integration action updates when access is disabled", async () => {
+    mockIsIntegrationActionEnabledForEmailAccountId.mockResolvedValue(false);
+
+    await expect(
+      updateRuleActions({
+        ruleId: RULE_ID,
+        actions: [integrationAction()],
+        provider: "gmail",
+        emailAccountId: EMAIL_ACCOUNT_ID,
+        logger,
+      }),
+    ).rejects.toThrow("Integration actions are not enabled for this user.");
+
+    expect(prisma.mcpConnection.findMany).not.toHaveBeenCalled();
+    expect(prisma.rule.update).not.toHaveBeenCalled();
+  });
+});
+
 describe("draft messaging actions", () => {
   beforeEach(resetRuleMocks);
 
@@ -888,6 +935,67 @@ describe("draft messaging actions", () => {
   });
 });
 
+describe("explicit rule creation", () => {
+  beforeEach(resetRuleMocks);
+
+  it.each([
+    ActionType.FORWARD,
+    ActionType.REPLY,
+    ActionType.SEND_EMAIL,
+  ])("creates an enabled %s rule without a second enable step", async (type) => {
+    prisma.rule.create.mockImplementation(
+      async ({ data }) =>
+        ({
+          ...data,
+          id: RULE_ID,
+          actions: [],
+          group: null,
+        }) as any,
+    );
+    vi.mocked(getActionRiskLevel).mockReturnValue({
+      level: "high",
+      message: "Dynamic content",
+    });
+    const rule = await createRule({
+      result: createRuleResult({ actions: [{ ...forwardAction(), type }] }),
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      provider: "gmail",
+      runOnThreads: true,
+      logger,
+    });
+    expect(rule.enabled).toBe(true);
+  });
+
+  it("does not silently disable a submitted rule based on example text", async () => {
+    prisma.rule.create.mockImplementation(
+      async ({ data }) =>
+        ({
+          ...data,
+          id: RULE_ID,
+          actions: [],
+          group: null,
+        }) as any,
+    );
+    const rule = await createRule({
+      result: createRuleResult({
+        from: "sender@example.com",
+        actions: [
+          {
+            type: ActionType.REPLY,
+            fields: { content: "Book at https://cal.com/example" },
+            delayInMinutes: null,
+          } as RuleAction,
+        ],
+      }),
+      emailAccountId: EMAIL_ACCOUNT_ID,
+      provider: "gmail",
+      runOnThreads: true,
+      logger,
+    });
+    expect(rule.enabled).toBe(true);
+  });
+});
+
 function resetRuleMocks() {
   vi.clearAllMocks();
   mockEnv.webhookActionsEnabled = true;
@@ -966,6 +1074,14 @@ function deleteAction(): RuleAction {
   return {
     type: ActionType.DELETE,
     fields: null,
+    delayInMinutes: null,
+  } as RuleAction;
+}
+
+function integrationAction(): RuleAction {
+  return {
+    type: ActionType.INTEGRATION,
+    fields: { content: "Create a task" } as any,
     delayInMinutes: null,
   } as RuleAction;
 }

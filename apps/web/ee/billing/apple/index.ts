@@ -21,6 +21,11 @@ import prisma from "@/utils/prisma";
 import { createPremiumForUser } from "@/utils/premium/create-premium";
 import { isOnHigherTier } from "@/utils/premium";
 import { trackServerConversionEvent } from "@/utils/analytics/server-conversion-events";
+import {
+  isAppleLocalTestingEnabled,
+  verifyLocalAppleNotification,
+  verifyLocalAppleTransaction,
+} from "./local-testing";
 import { APPLE_ROOT_CERTIFICATES } from "./root-certificates";
 
 type AppleEnvironment = Environment.PRODUCTION | Environment.SANDBOX;
@@ -76,17 +81,17 @@ function assertAppleConfig() {
     !getAppleSigningKey() ||
     !env.APPLE_IAP_BUNDLE_ID
   ) {
-    throw new Error("Apple IAP server configuration is incomplete");
+    throw new SafeError("Apple IAP server configuration is incomplete", 503);
   }
 }
 
 function assertAppleVerificationConfig(environment: AppleEnvironment) {
-  assertAppleConfig();
+  if (!env.APPLE_IAP_BUNDLE_ID) {
+    throw new SafeError("Apple IAP server configuration is incomplete", 503);
+  }
 
   if (environment === Environment.PRODUCTION && !env.APPLE_IAP_APPLE_ID) {
-    throw new Error(
-      "Apple IAP notification verification requires APPLE_IAP_APPLE_ID in production",
-    );
+    throw new SafeError("Apple IAP server configuration is incomplete", 503);
   }
 }
 
@@ -177,14 +182,17 @@ function getLookupEnvironments(
   environmentHint?: string | null,
 ): AppleEnvironment[] {
   const normalized = normalizeAppleEnvironment(environmentHint);
+  let environments: AppleEnvironment[];
+
   if (normalized === Environment.PRODUCTION) {
-    return [Environment.PRODUCTION, Environment.SANDBOX];
-  }
-  if (normalized === Environment.SANDBOX) {
-    return [Environment.SANDBOX, Environment.PRODUCTION];
+    environments = [Environment.PRODUCTION, Environment.SANDBOX];
+  } else if (normalized === Environment.SANDBOX) {
+    environments = [Environment.SANDBOX, Environment.PRODUCTION];
+  } else {
+    environments = [Environment.PRODUCTION, Environment.SANDBOX];
   }
 
-  return [Environment.PRODUCTION, Environment.SANDBOX];
+  return environments.filter(isAppleEnvironmentAllowed);
 }
 
 function decodeSignedPayloadUnsafe<T>(signedPayload: string): T {
@@ -214,6 +222,49 @@ function deriveFallbackAppleStatus(
   if (transaction.revocationDate) return "REVOKED";
   if (!transaction.expiresDate) return "ACTIVE";
   return transaction.expiresDate > Date.now() ? "ACTIVE" : "EXPIRED";
+}
+
+function stateFromDecodedTransaction({
+  environment,
+  fallbackOriginalTransactionId,
+  status,
+  transaction,
+  transactionId,
+}: {
+  environment: AppleEnvironment;
+  fallbackOriginalTransactionId?: string | null;
+  status?: string | null;
+  transaction: JWSTransactionDecodedPayload;
+  transactionId?: string | null;
+}): AppleSubscriptionState {
+  const productId = transaction.productId || "";
+  const originalTransactionId =
+    transaction.originalTransactionId ||
+    fallbackOriginalTransactionId ||
+    transaction.transactionId ||
+    "";
+  if (!originalTransactionId) {
+    throw new SafeError("Apple transaction has no originalTransactionId");
+  }
+
+  return {
+    appAccountToken: transaction.appAccountToken || null,
+    currency: transaction.currency || null,
+    environment,
+    expiresAt: toDate(transaction.expiresDate),
+    latestTransactionId:
+      transaction.transactionId || transactionId || originalTransactionId,
+    originalTransactionId,
+    offerDiscountType: transaction.offerDiscountType || null,
+    price: transaction.price ?? null,
+    productId,
+    purchaseDate: toDate(transaction.purchaseDate),
+    revokedAt: toDate(transaction.revocationDate),
+    status: status || deriveFallbackAppleStatus(transaction),
+    subscriptionGroupIdentifier:
+      transaction.subscriptionGroupIdentifier || null,
+    tier: productId ? getAppleSubscriptionTier({ productId }) : null,
+  };
 }
 
 function sortAppleStatusCandidates(
@@ -274,6 +325,19 @@ async function verifyAppleNotificationInEnvironment({
 }
 
 export async function verifyAppleNotificationPayload(signedPayload: string) {
+  if (isAppleLocalTestingEnabled()) {
+    const local = await verifyLocalAppleNotification(signedPayload);
+    if (local?.transaction) {
+      return {
+        environment: Environment.SANDBOX,
+        notification:
+          local.notification as unknown as ResponseBodyV2DecodedPayload,
+        renewalInfo: null,
+        transaction: local.transaction as JWSTransactionDecodedPayload,
+      } satisfies AppleVerifiedNotification;
+    }
+  }
+
   let lastError: unknown;
 
   for (const environment of getLookupEnvironments()) {
@@ -397,32 +461,15 @@ async function lookupTransactionInEnvironment({
     );
   }
 
-  const resolvedOriginalTransactionId =
-    selectedTransaction.originalTransactionId || lookupOriginalTransactionId;
-  const resolvedProductId = selectedTransaction.productId || "";
-
-  return {
-    appAccountToken: selectedTransaction.appAccountToken || null,
-    currency: selectedTransaction.currency || null,
+  return stateFromDecodedTransaction({
     environment,
-    expiresAt: toDate(selectedTransaction.expiresDate),
-    latestTransactionId:
-      selectedTransaction.transactionId || transactionId || null,
-    originalTransactionId: resolvedOriginalTransactionId,
-    offerDiscountType: selectedTransaction.offerDiscountType || null,
-    price: selectedTransaction.price ?? null,
-    productId: resolvedProductId,
-    purchaseDate: toDate(selectedTransaction.purchaseDate),
-    revokedAt: toDate(selectedTransaction.revocationDate),
+    fallbackOriginalTransactionId: lookupOriginalTransactionId,
     status:
       getAppleStatusName(selectedItem?.status) ||
       deriveFallbackAppleStatus(selectedTransaction),
-    subscriptionGroupIdentifier:
-      selectedTransaction.subscriptionGroupIdentifier || null,
-    tier: resolvedProductId
-      ? getAppleSubscriptionTier({ productId: resolvedProductId })
-      : null,
-  } satisfies AppleSubscriptionState;
+    transaction: selectedTransaction,
+    transactionId,
+  });
 }
 
 export async function getAppleSubscriptionState({
@@ -543,23 +590,65 @@ async function resolvePremiumRecord({
   return { premiumId: premium.id, userIds: [ownerUserId] };
 }
 
+export async function verifyAppleSignedTransaction(signedTransaction: string) {
+  if (isAppleLocalTestingEnabled()) {
+    const local = await verifyLocalAppleTransaction(signedTransaction);
+    if (!local) throw new SafeError("Invalid Apple signed transaction");
+    return local as JWSTransactionDecodedPayload;
+  }
+
+  let lastError: unknown;
+  for (const environment of getLookupEnvironments()) {
+    try {
+      return await getAppleVerifier(environment).verifyAndDecodeTransaction(
+        signedTransaction,
+      );
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableAppleVerificationError(error)) break;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new SafeError("Invalid Apple signed transaction");
+}
+
 export async function syncAppleSubscriptionToDb({
   authenticatedUserId,
   environmentHint,
   logger,
   originalTransactionId,
   transactionId,
+  verifiedTransaction,
 }: {
   authenticatedUserId?: string;
   environmentHint?: string | null;
   logger: Logger;
+  verifiedTransaction?: JWSTransactionDecodedPayload | null;
 } & AppleLookupReference) {
-  const state = await getAppleSubscriptionState({
-    environmentHint,
-    logger,
-    originalTransactionId,
-    transactionId,
-  });
+  // A signed transaction is a point-in-time snapshot that a client can replay
+  // after a refund, so only the local emulator (which has no App Store Server
+  // API) may use it directly. Everywhere else Apple's live status is the truth.
+  const state =
+    verifiedTransaction && isAppleLocalTestingEnabled()
+      ? stateFromDecodedTransaction({
+          environment: Environment.SANDBOX,
+          transaction: verifiedTransaction,
+          transactionId,
+        })
+      : await getAppleSubscriptionState({
+          environmentHint,
+          logger,
+          originalTransactionId,
+          transactionId,
+        });
+
+  if (!isAppleEnvironmentAllowed(state.environment)) {
+    throw new SafeError(
+      "Sandbox Apple subscriptions cannot grant production access",
+    );
+  }
 
   if (!state.tier) {
     throw new SafeError(
@@ -676,4 +765,10 @@ export async function syncAppleSubscriptionToDb({
   });
 
   return updatedPremium;
+}
+
+function isAppleEnvironmentAllowed(environment: AppleEnvironment) {
+  return (
+    env.NODE_ENV !== "production" || environment === Environment.PRODUCTION
+  );
 }

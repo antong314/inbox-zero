@@ -59,6 +59,18 @@ module.exports = {
     // mismatches when passing Redis connections into queues.
     "ioredis",
 
+    // TypeScript 7 is the native Go compiler without the classic Compiler API;
+    // stay on 6 until the monorepo tooling ecosystem is ready.
+    "typescript",
+
+    // @slack/web-api@7 depends on @slack/types ^2
+    "@slack/types",
+
     "@types/node",
+
+    // Ultracite 7.10+/Biome 2.5.6 enable mass useSortedKeys failures across the repo.
+    // Stay pinned until a dedicated formatting migration.
+    "ultracite",
+    "@biomejs/biome",
   ],
 };

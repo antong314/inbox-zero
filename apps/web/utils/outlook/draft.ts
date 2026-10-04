@@ -1,57 +1,70 @@
 import type { Message } from "@microsoft/microsoft-graph-types";
 import type { OutlookClient } from "@/utils/outlook/client";
 import type { Logger } from "@/utils/logger";
-import { isNotFoundError } from "@/utils/outlook/errors";
+import {
+  isNotFoundError,
+  isPreconditionFailedError,
+} from "@/utils/outlook/errors";
 import {
   convertMessage,
   getCategoryMap,
   getFolderIds,
+  MESSAGE_EXPAND_ATTACHMENTS,
 } from "@/utils/outlook/message";
-import { withOutlookRetry } from "@/utils/outlook/retry";
+import {
+  withMicrosoftGraphRetry,
+  withMicrosoftGraphWriteRetry,
+} from "@/utils/outlook/retry";
 
 export async function getDraft({
   client,
   draftId,
   logger,
+  includeAttachments = false,
 }: {
   client: OutlookClient;
   draftId: string;
   logger: Logger;
+  includeAttachments?: boolean;
 }) {
-  try {
-    const [response, folderIds, categoryMap] = await Promise.all([
-      withOutlookRetry(
-        () =>
-          client
-            .getClient()
-            .api(`/me/messages/${draftId}`)
-            .get() as Promise<Message>,
-        logger,
-      ),
-      getFolderIds(client, logger),
-      getCategoryMap(client, logger),
-    ]);
+  const [draft, categoryMap] = await Promise.all([
+    getDraftMessage({ client, draftId, logger, includeAttachments }),
+    getCategoryMap(client, logger),
+  ]);
+  if (!draft) return null;
 
-    // Treat drafts NOT in Drafts folder as "deleted" - when a draft is sent or deleted,
-    // it gets moved to another folder (Sent Items, Deleted Items, Outbox, etc.)
-    // For draft cleanup purposes, we only care about drafts in the Drafts folder
-    if (folderIds.drafts && response.parentFolderId !== folderIds.drafts) {
-      logger.info("Draft is no longer in Drafts folder, treating as deleted.", {
-        draftId,
-      });
-      return null;
-    }
+  return convertMessage(draft.message, draft.folderIds, categoryMap);
+}
 
-    const message = convertMessage(response, folderIds, categoryMap);
-    return message;
-  } catch (error) {
-    if (isNotFoundError(error)) {
-      logger.info("Draft not found, returning null.", { draftId });
-      return null;
-    }
-
-    throw error;
+export async function getDraftReference({
+  client,
+  messageId,
+  logger,
+}: {
+  client: OutlookClient;
+  messageId: string;
+  logger: Logger;
+}): Promise<{ id: string; version: string } | null> {
+  const draft = await getDraftMessage({
+    client,
+    draftId: messageId,
+    logger,
+  });
+  if (!draft) return null;
+  if (!draft.folderIds.drafts) {
+    logger.warn("Could not verify the Outlook Drafts folder");
+    return null;
   }
+
+  const version = draftVersionFromMessage(draft.message);
+  if (!version) {
+    logger.warn(
+      "Outlook draft omitted etag and changeKey; using an unconditional version",
+      { messageId },
+    );
+  }
+
+  return { id: messageId, version: version ?? "*" };
 }
 
 export async function sendDraft({
@@ -67,13 +80,13 @@ export async function sendDraft({
 
   // Send the draft - this moves it from Drafts to Sent Items
   // The message ID stays the same after sending
-  await withOutlookRetry(
+  await withMicrosoftGraphWriteRetry(
     () => client.getClient().api(`/me/messages/${draftId}/send`).post({}),
     logger,
   );
 
   // Get the sent message to retrieve the conversationId (threadId)
-  const sentMessage = await withOutlookRetry(
+  const sentMessage = await withMicrosoftGraphRetry(
     () =>
       client
         .getClient()
@@ -99,30 +112,81 @@ export async function sendDraft({
 export async function deleteDraft({
   client,
   draftId,
+  version,
   logger,
 }: {
   client: OutlookClient;
   draftId: string;
+  version: string;
   logger: Logger;
-}) {
+}): Promise<boolean> {
   try {
     logger.info("Deleting draft", { draftId });
 
-    // DELETE moves the draft to Deleted Items folder (not permanently deleted)
-    // This is fine - getDraft() treats drafts not in Drafts folder as "deleted"
-    await withOutlookRetry(
-      () => client.getClient().api(`/me/messages/${draftId}`).delete(),
-      logger,
-    );
+    const request = client
+      .getClient()
+      .api(`/me/messages/${draftId}`)
+      .header("If-Match", version);
+
+    await withMicrosoftGraphWriteRetry(() => request.delete(), logger);
 
     logger.info("Draft deleted successfully", { draftId });
+    return true;
   } catch (error) {
-    if (isNotFoundError(error)) {
-      logger.info("Draft not found or already deleted", { draftId });
-      return;
+    if (isNotFoundError(error) || isPreconditionFailedError(error)) {
+      logger.info("Draft no longer matches the deletable version", { draftId });
+      return false;
     }
 
     logger.error("Failed to delete draft", { draftId, error });
     throw error;
   }
+}
+
+async function getDraftMessage({
+  client,
+  draftId,
+  logger,
+  includeAttachments = false,
+}: {
+  client: OutlookClient;
+  draftId: string;
+  logger: Logger;
+  includeAttachments?: boolean;
+}) {
+  try {
+    const [message, folderIds] = await Promise.all([
+      withMicrosoftGraphRetry(() => {
+        const request = client.getClient().api(`/me/messages/${draftId}`);
+        if (includeAttachments) request.expand(MESSAGE_EXPAND_ATTACHMENTS);
+        return request.get() as Promise<Message>;
+      }, logger),
+      getFolderIds(client, logger),
+    ]);
+
+    if (folderIds.drafts && message.parentFolderId !== folderIds.drafts) {
+      logger.info("Draft is no longer in Drafts folder, treating as deleted.", {
+        draftId,
+      });
+      return null;
+    }
+
+    return { message, folderIds };
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      logger.info("Draft not found, returning null.", { draftId });
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+function draftVersionFromMessage(message: Message): string | undefined {
+  const etag = (message as { "@odata.etag"?: string })["@odata.etag"];
+  if (etag) return etag;
+  if (!message.changeKey) return;
+  return message.changeKey.startsWith("W/")
+    ? message.changeKey
+    : `W/"${message.changeKey}"`;
 }

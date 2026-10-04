@@ -12,6 +12,8 @@ import { handleWebhookError } from "@/utils/webhook/error-handler";
 import { runWithBackgroundLoggerFlush } from "@/utils/logger-flush";
 import { getWebhookEmailAccount } from "@/utils/webhook/validate-webhook-account";
 
+import { notifyMailboxChanged } from "@/utils/mailbox-push";
+
 export const maxDuration = 300;
 
 export const POST = withError("outlook/webhook", async (request) => {
@@ -76,13 +78,15 @@ export const POST = withError("outlook/webhook", async (request) => {
   });
 
   const notifications = body.value;
+  const notifiedAccounts = new Set<string>();
 
   // Process notifications asynchronously using after() to avoid Microsoft webhook timeout
   // Microsoft expects a response within 3 seconds
   after(() =>
     runWithBackgroundLoggerFlush({
       logger,
-      task: () => processNotificationsAsync(notifications, logger),
+      task: () =>
+        processNotificationsAsync(notifications, logger, notifiedAccounts),
       extra: { url: "/api/outlook/webhook" },
     }),
   );
@@ -93,6 +97,7 @@ export const POST = withError("outlook/webhook", async (request) => {
 async function processNotificationsAsync(
   notifications: OutlookWebhookNotification[],
   log: Logger,
+  notifiedAccounts: Set<string>,
 ) {
   for (const notification of notifications) {
     const { subscriptionId } = notification;
@@ -123,7 +128,23 @@ async function processNotificationsAsync(
         changeType: notification.changeType,
       });
 
+      const emailAccount = await getWebhookEmailAccount(
+        { watchEmailsSubscriptionId: subscriptionId },
+        logger,
+      );
+      if (emailAccount && !notifiedAccounts.has(emailAccount.id)) {
+        notifiedAccounts.add(emailAccount.id);
+        // One notification per account per webhook, without waiting on Apple
+        // or delaying later notifications in this batch.
+        after(() =>
+          notifyMailboxChanged({
+            emailAccountId: emailAccount.id,
+            logger,
+          }),
+        );
+      }
       await processHistoryForUser({
+        preloadedEmailAccount: emailAccount,
         subscriptionId,
         resourceData,
         logger,

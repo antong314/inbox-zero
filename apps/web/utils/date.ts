@@ -1,6 +1,11 @@
 import { format } from "date-fns/format";
 import { formatDistanceToNow } from "date-fns/formatDistanceToNow";
+import { isSameDay } from "date-fns/isSameDay";
+import { isSameMonth } from "date-fns/isSameMonth";
+import { isSameYear } from "date-fns/isSameYear";
 import { isWeekend } from "date-fns/isWeekend";
+import { startOfDay } from "date-fns/startOfDay";
+import { subDays } from "date-fns/subDays";
 import { TZDate } from "@date-fns/tz";
 import { createScopedLogger } from "@/utils/logger";
 import { captureException } from "@/utils/error";
@@ -10,6 +15,7 @@ export const ONE_HOUR_MS = ONE_MINUTE_MS * 60;
 export const ONE_DAY_MS = ONE_HOUR_MS * 24;
 export const ONE_MONTH_MS = ONE_DAY_MS * 30;
 export const ONE_YEAR_MS = ONE_DAY_MS * 365;
+export const TEN_YEARS_MS = ONE_YEAR_MS * 10;
 
 export const ONE_HOUR_MINUTES = 60;
 export const ONE_DAY_MINUTES = ONE_HOUR_MINUTES * 24;
@@ -44,16 +50,33 @@ export function formatShortDate(
     date.getFullYear() === today.getFullYear();
 
   if (isToday) {
-    // Use hour: 'numeric' to avoid leading zeros (e.g., 3:44 PM instead of 03:44 PM)
-    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return shortDateFormatter("time").format(date);
   }
-  const formattedDate = date.toLocaleDateString([], {
-    month: "short",
-    day: "numeric",
-    year: options.includeYear ? "numeric" : undefined,
-  });
+  const formattedDate = shortDateFormatter(
+    options.includeYear ? "dateWithYear" : "date",
+  ).format(date);
 
   return options.lowercase ? formattedDate : formattedDate.toUpperCase();
+}
+
+/**
+ * Labels a date for grouping an email list into sections. The sections are
+ * deliberately coarse so a list only ever carries a handful of headings.
+ * - Today and yesterday get their own sections.
+ * - The rest of the past week is one "Last 7 days" section.
+ * - Older days in the current month are one "Earlier this month" section.
+ * - Earlier dates are labelled by month (e.g. "August", or "August 2024").
+ * - A date ahead of today keeps its own day, so a sender with a skewed clock
+ *   is never filed under a section that has already passed.
+ */
+export function formatDateGroupLabel(date: Date, now: Date = new Date()) {
+  if (isSameDay(date, now)) return "Today";
+  if (isSameDay(date, subDays(now, 1))) return "Yesterday";
+  if (date > now) return format(date, "MMMM do, yyyy");
+  if (date >= startOfDay(subDays(now, 6))) return "Last 7 days";
+  if (isSameMonth(date, now)) return "Earlier this month";
+  if (isSameYear(date, now)) return format(date, "MMMM");
+  return format(date, "MMMM yyyy");
 }
 
 export function dateToSeconds(date: Date) {
@@ -256,4 +279,26 @@ function getNextZonedMidnight(date: Date, timezone: string) {
     0,
     timezone,
   );
+}
+
+const shortDateFormats = {
+  // Numeric hours avoid leading zeros (3:44 PM, not 03:44 PM).
+  time: { hour: "numeric", minute: "2-digit" },
+  date: { month: "short", day: "numeric" },
+  dateWithYear: { month: "short", day: "numeric", year: "numeric" },
+} satisfies Record<string, Intl.DateTimeFormatOptions>;
+// Mail lists format a date per row on every render, and building an Intl
+// formatter each time dominated that cost.
+const shortDateFormatters = new Map<
+  keyof typeof shortDateFormats,
+  Intl.DateTimeFormat
+>();
+
+function shortDateFormatter(kind: keyof typeof shortDateFormats) {
+  let formatter = shortDateFormatters.get(kind);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(undefined, shortDateFormats[kind]);
+    shortDateFormatters.set(kind, formatter);
+  }
+  return formatter;
 }

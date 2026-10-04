@@ -2,6 +2,8 @@ import type { ModelMessage } from "ai";
 import { beforeEach, vi } from "vitest";
 import {
   captureAssistantChatTrace,
+  hasAssistantWriteToolCalls,
+  isAssistantWriteToolName,
   getFirstMatchingToolCall,
   getLastMatchingToolCall as getSharedLastMatchingToolCall,
   summarizeRecordedToolCalls,
@@ -30,31 +32,12 @@ export const inboxWorkflowProviders = [
   {
     provider: "google",
     label: "google",
-    unreadSignal: "is:unread",
   },
   {
     provider: "microsoft",
     label: "microsoft",
-    unreadSignal: "unread",
   },
 ] as const;
-
-const writeToolNames = new Set([
-  "manageInbox",
-  "createRule",
-  "updateRuleConditions",
-  "updateRuleActions",
-  "updateLearnedPatterns",
-  "updatePersonalInstructions",
-  "updateAssistantSettings",
-  "sendEmail",
-  "replyEmail",
-  "forwardEmail",
-  "createOrGetFolder",
-  "moveThreadsToFolder",
-  "saveMemory",
-  "addToKnowledgeBase",
-]);
 
 const hoisted = vi.hoisted(() => ({
   mockCreateRule: vi.fn(),
@@ -90,13 +73,14 @@ const {
   mockUpdateRuleActions,
   mockSaveLearnedPatterns,
   mockCreateEmailProvider,
-  mockGetMessage,
   mockArchiveThreadWithLabel,
   mockMarkReadThread,
   mockBulkArchiveFromSenders,
 } = hoisted;
 
 export const mockSearchMessages = hoisted.mockSearchMessages;
+export const mockGetMessage = hoisted.mockGetMessage;
+export { mockArchiveThreadWithLabel };
 export const mockGetFolders = hoisted.mockGetFolders;
 export const mockGetOrCreateFolderIdByName =
   hoisted.mockGetOrCreateFolderIdByName;
@@ -251,6 +235,16 @@ export function getFirstSearchInboxCall(toolCalls: RecordedToolCall[]) {
     ?.input;
 }
 
+export function getSearchInboxCalls(toolCalls: RecordedToolCall[]) {
+  return toolCalls
+    .filter(
+      (toolCall): toolCall is RecordedToolCall & { input: SearchInboxInput } =>
+        toolCall.toolName === "searchInbox" &&
+        isSearchInboxInput(toolCall.input),
+    )
+    .map((toolCall) => toolCall.input);
+}
+
 export const getLastMatchingToolCall = getSharedLastMatchingToolCall;
 
 export function isReadEmailInput(input: unknown): input is ReadEmailInput {
@@ -295,35 +289,36 @@ export function isBulkArchiveSendersInput(
 }
 
 export function hasNoWriteToolCalls(toolCalls: RecordedToolCall[]) {
-  return !toolCalls.some((toolCall) => isWriteToolName(toolCall.toolName));
+  return !hasAssistantWriteToolCalls(toolCalls);
 }
 
 export function hasUnreadTriageSignal(
-  query: string,
+  searchCall: SearchInboxInput,
   provider: "google" | "microsoft",
-  unreadSignal: string,
 ) {
-  const normalizedQuery = query.toLowerCase();
+  const normalizedQuery = searchCall.query.toLowerCase();
 
   if (provider === "microsoft") {
     return (
-      /\bunread\b/.test(normalizedQuery) &&
+      (searchCall.readState === "unread" ||
+        /\bunread\b/.test(normalizedQuery)) &&
       !containsForbiddenMicrosoftQueryOperator(normalizedQuery)
     );
   }
 
-  return normalizedQuery.includes(unreadSignal);
+  return normalizedQuery.includes("is:unread");
 }
 
 export function hasReplyTriageFocus(
-  query: string,
+  searchCall: SearchInboxInput,
   provider: "google" | "microsoft",
 ) {
-  const normalizedQuery = query.toLowerCase();
+  const normalizedQuery = searchCall.query.toLowerCase();
   if (provider === "microsoft") {
     return (
       !containsForbiddenMicrosoftQueryOperator(normalizedQuery) &&
-      ["reply", "respond"].some((term) => normalizedQuery.includes(term))
+      (searchCall.categoryName?.toLowerCase() === "to reply" ||
+        ["reply", "respond"].some((term) => normalizedQuery.includes(term)))
     );
   }
 
@@ -361,7 +356,7 @@ export function hasSearchBeforeFirstWrite(toolCalls: RecordedToolCall[]) {
   if (firstSearchIndex < 0) return false;
 
   const firstWriteIndex = toolCalls.findIndex((toolCall) =>
-    isWriteToolName(toolCall.toolName),
+    isAssistantWriteToolName(toolCall.toolName),
   );
 
   return firstWriteIndex < 0 || firstSearchIndex < firstWriteIndex;
@@ -406,6 +401,8 @@ type SearchInboxInput = {
   query: string;
   limit?: number;
   pageToken?: string | null;
+  categoryName?: string | null;
+  readState?: "read" | "unread" | null;
 };
 
 type ReadEmailInput = {
@@ -432,14 +429,20 @@ function isSearchInboxInput(input: unknown): input is SearchInboxInput {
 
 function summarizeToolCall(toolCall: RecordedToolCall) {
   if (isSearchInboxInput(toolCall.input)) {
-    return `${toolCall.toolName}(query=${toolCall.input.query}, limit=${toolCall.input.limit ?? "default"})`;
+    const fields = [
+      `query=${toolCall.input.query}`,
+      `limit=${toolCall.input.limit ?? "default"}`,
+    ];
+    if (toolCall.input.readState) {
+      fields.push(`readState=${toolCall.input.readState}`);
+    }
+    if (toolCall.input.categoryName) {
+      fields.push(`categoryName=${toolCall.input.categoryName}`);
+    }
+    return `${toolCall.toolName}(${fields.join(", ")})`;
   }
 
   return toolCall.toolName;
-}
-
-function isWriteToolName(toolName: string) {
-  return writeToolNames.has(toolName);
 }
 
 function getDefaultLabels() {

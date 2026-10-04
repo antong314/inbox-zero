@@ -4,12 +4,17 @@ import { z } from "zod";
 import { after } from "next/server";
 import { Prisma } from "@/generated/prisma/client";
 import prisma from "@/utils/prisma";
+import { withThreadPageBufferDeletion } from "@/utils/redis/thread-page-buffer";
 import { deleteUser } from "@/utils/user/delete";
 import { actionClient, actionClientUser } from "@/utils/actions/safe-action";
 import { captureException, SafeError } from "@/utils/error";
 import { updateAccountSeats } from "@/utils/premium/seats";
 import { betterAuthConfig } from "@/utils/auth";
-import { headers } from "next/headers";
+import { cookies, headers } from "next/headers";
+import {
+  LAST_EMAIL_ACCOUNT_COOKIE,
+  parseLastEmailAccountCookieValue,
+} from "@/utils/cookies";
 import {
   saveAboutBody,
   saveSignatureBody,
@@ -17,6 +22,8 @@ import {
   updateAIDraftCleanupSettingsBody,
 } from "@/utils/actions/user.validation";
 import { clearLastEmailAccountCookie } from "@/utils/cookies.server";
+import { deleteAccountUploadDirectory } from "@/utils/mail-api/upload-blobs";
+import { deleteTinybirdEmailData } from "@inboxzero/tinybird";
 import { aliasPosthogUser } from "@/utils/posthog";
 import {
   cleanupAIDraftsForAccount,
@@ -236,6 +243,26 @@ export const deleteEmailAccountAction = actionClientUser
         );
       }
 
+      after(() =>
+        deleteTinybirdEmailData([emailAccount.email]).catch((error) => {
+          logger.error("Error deleting Tinybird data", { error });
+          captureException(error);
+        }),
+      );
+
+      await deleteAccountUploadDirectory(emailAccountId).catch((error) => {
+        logger.error("Failed to delete account mail uploads", {
+          error,
+          emailAccountId,
+        });
+      });
+
+      await clearLastEmailAccountCookieIfMatching({
+        userId,
+        emailAccountId,
+        logger,
+      });
+
       after(async () => {
         await updateAccountSeats({ userId });
       });
@@ -252,15 +279,17 @@ async function runDeleteEmailAccountTransaction(
   },
 ) {
   try {
-    await prisma.$transaction([
-      prisma.$queryRaw`
+    await withThreadPageBufferDeletion([context.emailAccountId], () =>
+      prisma.$transaction([
+        prisma.$queryRaw`
         SELECT true AS locked
         FROM (
           SELECT pg_advisory_xact_lock(539114481, hashtext(${userId}))
         ) lock
       `,
-      ...operations,
-    ]);
+        ...operations,
+      ]),
+    );
   } catch (error) {
     context.logger.error("Delete email account transaction failed", {
       error,
@@ -329,6 +358,28 @@ async function assertEmailAccountCanBeDeleted(emailAccountId: string) {
     ownershipImpact,
     DELETE_EMAIL_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR,
   );
+}
+
+async function clearLastEmailAccountCookieIfMatching({
+  userId,
+  emailAccountId,
+  logger,
+}: {
+  userId: string;
+  emailAccountId: string;
+  logger: Logger;
+}) {
+  try {
+    const cookieStore = await cookies();
+    const lastEmailAccountId = parseLastEmailAccountCookieValue({
+      userId,
+      cookieValue: cookieStore.get(LAST_EMAIL_ACCOUNT_COOKIE)?.value,
+    });
+    if (lastEmailAccountId !== emailAccountId) return;
+    await clearLastEmailAccountCookie();
+  } catch (error) {
+    logger.error("Failed to clear last email account cookie", { error });
+  }
 }
 
 async function assertUserAccountCanBeDeleted(userId: string) {

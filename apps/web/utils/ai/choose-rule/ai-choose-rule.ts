@@ -9,7 +9,7 @@ import {
   isOllamaProvider,
 } from "@/utils/llms/ollama-guidance";
 import { getUserInfoPrompt, getUserRulesPrompt } from "@/utils/ai/helpers";
-import { sortRulesForAutomation } from "@/utils/rule/sort";
+import { sortRulesByCanonicalOrder } from "@/utils/rule/sort";
 import type { Logger } from "@/utils/logger";
 import type { ClassificationFeedbackItem } from "@/utils/rule/classification-feedback";
 
@@ -43,7 +43,7 @@ export async function aiChooseRule<
 }> {
   if (!rules.length) return { rules: [], reason: "No rules to evaluate" };
 
-  const orderedRules = sortRulesForAutomation(rules);
+  const orderedRules = sortRulesByCanonicalOrder(rules);
 
   const { result: aiResponse } = await getAiResponse({
     email,
@@ -108,9 +108,7 @@ async function getAiResponse(options: GetAiResponseOptions): Promise<{
     promptHardening: { trust: "untrusted", level: "full" },
   });
 
-  const hasCustomRules = rules.some((rule) => !rule.systemType);
-
-  if (hasCustomRules && emailAccount.multiRuleSelectionEnabled) {
+  if (shouldSelectMultipleRules({ rules, emailAccount })) {
     const result = await getAiResponseMultiRule({
       email,
       emailAccount,
@@ -192,7 +190,7 @@ ${stringifyEmail(email, 500)}
 
   const aiResponse = await generateObject({
     ...modelOptions,
-    system,
+    instructions: system,
     prompt,
     schema: z.object({
       reasoning: z
@@ -304,11 +302,11 @@ ${stringifyEmail(email, 500)}
 
   const aiResponse = await generateObject({
     ...modelOptions,
-    system: appendOllamaOnlySystemGuidance(
-      { system },
+    instructions: appendOllamaOnlySystemGuidance(
+      { instructions: system },
       modelOptions,
       OLLAMA_MULTI_RULE_SELECTION_GUIDANCE,
-    ).system,
+    ).instructions,
     prompt,
     schema: z.object({
       matchedRules: z
@@ -441,3 +439,17 @@ const OLLAMA_MULTI_RULE_SELECTION_GUIDANCE = [
   "When one specific transactional rule fully explains the email, do not also select a generic notification or account-update rule.",
   "Prefer one best rule when candidate rules refer to the same underlying event.",
 ] as const;
+
+// Multiple rules only make sense when the user has custom rules to combine.
+export function shouldSelectMultipleRules({
+  rules,
+  emailAccount,
+}: {
+  rules: { systemType?: string | null }[];
+  emailAccount: Pick<EmailAccountWithAI, "multiRuleSelectionEnabled">;
+}) {
+  return (
+    emailAccount.multiRuleSelectionEnabled &&
+    rules.some((rule) => !rule.systemType)
+  );
+}

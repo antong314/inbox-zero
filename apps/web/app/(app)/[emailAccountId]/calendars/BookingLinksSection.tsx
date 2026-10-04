@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Copy, ExternalLink, Link2, Settings2, Zap } from "lucide-react";
 import { useAction } from "next-safe-action/hooks";
 import { useForm, type SubmitHandler } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type { z } from "zod";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CardBasic } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -73,8 +74,6 @@ function InboxZeroBookingLinkPanel() {
     data?.bookingLinks.find(
       (bookingLink) => bookingLink.id === configureLinkId,
     ) ?? null;
-  const timezone =
-    data?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   const defaultName = emailAccount?.name?.trim() || null;
   const defaultTitle = "Booking link";
   const defaultSlug = getBookingLinkSlugSuggestion(defaultName);
@@ -143,10 +142,7 @@ function InboxZeroBookingLinkPanel() {
           defaultSlug={defaultSlug}
           onClose={() => setCreateOpen(false)}
           onCreate={async (input) => {
-            const result = await createLink({
-              ...input,
-              timezone,
-            });
+            const result = await createLink(input);
             const newLinkId = result?.data?.id;
             if (!newLinkId) return;
 
@@ -197,22 +193,6 @@ function CalendarBookingLinkCard({
     },
   );
 
-  const {
-    register,
-    handleSubmit,
-    reset,
-    formState: { errors },
-  } = useForm<z.infer<typeof updateBookingLinkBody>>({
-    resolver: zodResolver(updateBookingLinkBody),
-    defaultValues: { bookingLink: calendarBookingLink || "" },
-  });
-
-  useEffect(() => {
-    if (calendarBookingLink !== null || data) {
-      reset({ bookingLink: calendarBookingLink || "" });
-    }
-  }, [calendarBookingLink, reset, data]);
-
   const onSubmit: SubmitHandler<z.infer<typeof updateBookingLinkBody>> = (
     formData,
   ) => {
@@ -239,33 +219,61 @@ function CalendarBookingLinkCard({
             <span className="text-sm text-muted-foreground">
               Using Inbox Zero booking link
             </span>
-          ) : (
-            <form
-              onSubmit={handleSubmit(onSubmit)}
-              className="flex flex-col gap-2 sm:flex-row sm:items-center w-full md:w-auto"
-            >
-              <div className="w-full sm:w-80">
-                <Input
-                  type="url"
-                  name="bookingLink"
-                  placeholder="https://cal.com/your-link"
-                  registerProps={register("bookingLink")}
-                  error={errors.bookingLink}
-                />
-              </div>
-              <Button
-                type="submit"
-                loading={isExecuting}
-                size="sm"
-                className="w-full sm:w-auto"
-              >
-                Save
-              </Button>
-            </form>
-          )}
+          ) : data ? (
+            <CalendarBookingLinkForm
+              key={calendarBookingLink || "empty"}
+              bookingLink={calendarBookingLink}
+              isExecuting={isExecuting}
+              onSubmit={onSubmit}
+            />
+          ) : null}
         </LoadingContent>
       }
     />
+  );
+}
+
+function CalendarBookingLinkForm({
+  bookingLink,
+  isExecuting,
+  onSubmit,
+}: {
+  bookingLink: string | null;
+  isExecuting: boolean;
+  onSubmit: SubmitHandler<z.infer<typeof updateBookingLinkBody>>;
+}) {
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<z.infer<typeof updateBookingLinkBody>>({
+    resolver: zodResolver(updateBookingLinkBody),
+    defaultValues: { bookingLink: bookingLink || "" },
+  });
+
+  return (
+    <form
+      onSubmit={handleSubmit(onSubmit)}
+      className="flex flex-col gap-2 sm:flex-row sm:items-center w-full md:w-auto"
+    >
+      <div className="w-full sm:w-80">
+        <Input
+          type="url"
+          name="bookingLink"
+          placeholder="https://cal.com/your-link"
+          registerProps={register("bookingLink")}
+          error={errors.bookingLink}
+        />
+      </div>
+      <Button
+        type="submit"
+        loading={isExecuting}
+        size="sm"
+        className="w-full sm:w-auto"
+      >
+        Save
+      </Button>
+    </form>
   );
 }
 
@@ -274,9 +282,9 @@ function EmptyLinkCard({ onCreate }: { onCreate: () => void }) {
     <CardBasic className="px-4 py-4">
       <div className="mb-1 flex items-center gap-2">
         <h3 className="font-medium">Booking link</h3>
-        <span className="rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-blue-600 dark:border-blue-900 dark:bg-blue-950 dark:text-blue-400">
+        <Badge variant="info" size="xs">
           New
-        </span>
+        </Badge>
       </div>
       <p className="mb-4 text-sm text-muted-foreground">
         Create a link people can use to book time on your calendar.
@@ -322,10 +330,10 @@ function ActiveLinkCard({
           <div className="flex items-center gap-2">
             <h3 className="font-medium">Booking link</h3>
             {!isActive ? (
-              <span className="inline-flex items-center gap-1 rounded-md border bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground">
+              <Badge variant="muted" size="sm">
                 <span className="size-1.5 rounded-full bg-muted-foreground/60" />
                 Inactive
-              </span>
+              </Badge>
             ) : null}
           </div>
           <p className="text-sm text-muted-foreground">

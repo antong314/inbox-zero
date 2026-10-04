@@ -1,9 +1,14 @@
 import type { Message } from "@microsoft/microsoft-graph-types";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import type { OutlookClient } from "@/utils/outlook/client";
-import { createTestLogger } from "@/__tests__/helpers";
+import { createTestLogger, getMockMessage } from "@/__tests__/helpers";
 import type { EmailForAction } from "@/utils/ai/types";
-import { draftEmail, forwardEmail, sendEmailWithHtml } from "./mail";
+import {
+  draftEmail,
+  forwardEmail,
+  replyToEmail,
+  sendEmailWithHtml,
+} from "./mail";
 
 vi.mock("@/utils/mail", () => ({
   ensureEmailSendingEnabled: vi.fn(),
@@ -16,6 +21,130 @@ vi.mock("@/utils/sleep", () => ({
 describe("sendEmailWithHtml", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("rejects a reply without a recipient before creating the reply draft", async () => {
+    const api = vi.fn(() => {
+      throw new Error("Graph should not be called");
+    });
+    const client = createMockOutlookClient(api);
+
+    await expect(
+      sendEmailWithHtml(
+        client,
+        {
+          to: "",
+          subject: "Re: Subject",
+          messageHtml: "<p>Hello</p>",
+          replyToEmail: {
+            threadId: "thread-1",
+            headerMessageId: "<message-1@example.com>",
+            messageId: "message-1",
+          },
+        },
+        createTestLogger(),
+      ),
+    ).rejects.toThrow("Recipient address is required");
+
+    expect(api).not.toHaveBeenCalled();
+  });
+
+  it("parses the recipients of a reply", async () => {
+    const createReplyPost = vi.fn(
+      async () =>
+        ({ id: "reply-1", conversationId: "conversation-1" }) as Message,
+    );
+    const patchDraft = vi.fn(async () => ({}));
+    const sendPost = vi.fn(async () => ({}));
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1/createReply")
+        return { post: createReplyPost };
+      if (path === "/me/messages/reply-1") return { patch: patchDraft };
+      if (path === "/me/messages/reply-1/send") return { post: sendPost };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await sendEmailWithHtml(
+      client,
+      {
+        to: "Recipient Name <recipient@example.com>, second@example.com",
+        cc: "Copied Name <copied@example.com>",
+        bcc: "Blind Name <blind@example.com>",
+        subject: "Re: Subject",
+        messageHtml: "<p>Replying</p>",
+        replyToEmail: {
+          threadId: "conversation-1",
+          headerMessageId: "<message-1@example.com>",
+          messageId: "message-1",
+        },
+      },
+      createTestLogger(),
+    );
+
+    expect(patchDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toRecipients: [
+          {
+            emailAddress: {
+              address: "recipient@example.com",
+              name: "Recipient Name",
+            },
+          },
+          { emailAddress: { address: "second@example.com" } },
+        ],
+        ccRecipients: [
+          {
+            emailAddress: {
+              address: "copied@example.com",
+              name: "Copied Name",
+            },
+          },
+        ],
+        bccRecipients: [
+          {
+            emailAddress: { address: "blind@example.com", name: "Blind Name" },
+          },
+        ],
+      }),
+    );
+  });
+
+  it("leaves out the recipient fields a reply does not use", async () => {
+    const createReplyPost = vi.fn(
+      async () =>
+        ({ id: "reply-1", conversationId: "conversation-1" }) as Message,
+    );
+    const patchDraft = vi.fn(async () => ({}));
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1/createReply")
+        return { post: createReplyPost };
+      if (path === "/me/messages/reply-1") return { patch: patchDraft };
+      if (path === "/me/messages/reply-1/send") return { post: vi.fn() };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await sendEmailWithHtml(
+      client,
+      {
+        to: "recipient@example.com",
+        cc: "",
+        subject: "Re: Subject",
+        messageHtml: "<p>Replying</p>",
+        replyToEmail: {
+          threadId: "conversation-1",
+          headerMessageId: "<message-1@example.com>",
+          messageId: "message-1",
+        },
+      },
+      createTestLogger(),
+    );
+
+    const payload = patchDraft.mock.calls.at(0)?.[0];
+    assert.isDefined(payload);
+    expect(payload).not.toHaveProperty("ccRecipients");
+    expect(payload).not.toHaveProperty("bccRecipients");
   });
 
   it("parses formatted recipients when sending a new draft", async () => {
@@ -67,7 +196,7 @@ describe("sendEmailWithHtml", () => {
     );
     expect(sendPost).toHaveBeenCalledTimes(1);
     expect(result).toEqual({
-      id: "",
+      id: "draft-1",
       conversationId: "conversation-1",
     });
   });
@@ -114,6 +243,54 @@ describe("sendEmailWithHtml", () => {
     expect(attachmentPost).toHaveBeenCalledWith(
       expect.objectContaining({
         contentBytes: base64Content,
+      }),
+    );
+    expect(sendPost).toHaveBeenCalledTimes(1);
+  });
+
+  it("uploads inline images with Graph Content-ID semantics", async () => {
+    const draftPost = vi.fn(
+      async () =>
+        ({
+          id: "draft-1",
+          conversationId: "conversation-1",
+        }) as Message,
+    );
+    const attachmentPost = vi.fn(async () => ({}));
+    const sendPost = vi.fn(async () => ({}));
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages") return { post: draftPost };
+      if (path === "/me/messages/draft-1/attachments") {
+        return { post: attachmentPost };
+      }
+      if (path === "/me/messages/draft-1/send") return { post: sendPost };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    await sendEmailWithHtml(
+      client,
+      {
+        to: "recipient@example.com",
+        subject: "Subject",
+        messageHtml: '<p>Diagram <img src="cid:diagram@example"></p>',
+        attachments: [
+          {
+            filename: "diagram.png",
+            content: Buffer.from("image-bytes"),
+            contentType: "image/png",
+            contentDisposition: "inline",
+            cid: "diagram@example",
+          },
+        ],
+      },
+      createTestLogger(),
+    );
+
+    expect(attachmentPost).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contentId: "diagram@example",
+        isInline: true,
       }),
     );
     expect(sendPost).toHaveBeenCalledTimes(1);
@@ -215,7 +392,7 @@ describe("sendEmailWithHtml", () => {
     expect(sendPost).toHaveBeenCalledTimes(1);
   });
 
-  it("retries upload-session chunks and sends them as octet-stream", async () => {
+  it("retries upload-session chunks and preserves inline metadata", async () => {
     const draftPost = vi.fn(
       async () =>
         ({
@@ -255,12 +432,14 @@ describe("sendEmailWithHtml", () => {
       {
         to: "recipient@example.com",
         subject: "Subject",
-        messageHtml: "<p>Hello</p>",
+        messageHtml: '<p><img src="cid:large-image@example"></p>',
         attachments: [
           {
-            filename: "large.pdf",
+            filename: "large-image.png",
             content: Buffer.alloc(totalSize),
-            contentType: "application/pdf",
+            contentType: "image/png",
+            contentDisposition: "inline",
+            cid: "large-image@example",
           },
         ],
       },
@@ -270,7 +449,9 @@ describe("sendEmailWithHtml", () => {
     expect(createUploadSessionPost).toHaveBeenCalledWith(
       expect.objectContaining({
         AttachmentItem: expect.objectContaining({
-          name: "large.pdf",
+          contentId: "large-image@example",
+          isInline: true,
+          name: "large-image.png",
           size: totalSize,
         }),
       }),
@@ -299,207 +480,75 @@ describe("sendEmailWithHtml", () => {
     expect(sendPost).toHaveBeenCalledTimes(1);
   });
 
-  it("resumes upload-session progress after a retried chunk returns 416", async () => {
-    const draftPost = vi.fn(
+  it("keeps a forward in its conversation by drafting from the source message", async () => {
+    const createForwardPost = vi.fn(
       async () =>
-        ({
-          id: "draft-1",
-          conversationId: "conversation-1",
-        }) as Message,
+        ({ id: "forward-1", conversationId: "conversation-1" }) as Message,
     );
-    const createUploadSessionPost = vi.fn(async () => ({
-      uploadUrl: "https://upload.example.test/session",
-    }));
+    const patchDraft = vi.fn(async () => ({}));
     const sendPost = vi.fn(async () => ({}));
-    const totalSize = 3 * 1024 * 1024 + 1;
-    const chunkSize = 320 * 1024;
-    let firstChunkAttempt = 0;
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-      if (init?.method === "GET") {
-        return new Response(
-          JSON.stringify({
-            nextExpectedRanges: [`${chunkSize}-${totalSize - 1}`],
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          },
-        );
-      }
-
-      const contentRange = getContentRangeHeader(init);
-      if (contentRange === `bytes 0-${chunkSize - 1}/${totalSize}`) {
-        if (firstChunkAttempt === 0) {
-          firstChunkAttempt += 1;
-          throw new TypeError("fetch failed");
-        }
-
-        if (firstChunkAttempt === 1) {
-          firstChunkAttempt += 1;
-          return new Response("already received", { status: 416 });
-        }
-      }
-
-      const parsedRange = parseContentRange(contentRange);
-      if (!parsedRange)
-        throw new Error(`Unexpected content range: ${contentRange}`);
-
-      if (parsedRange.endInclusive + 1 >= parsedRange.totalSize) {
-        return new Response(null, { status: 201 });
-      }
-
-      return createUploadChunkProgressResponse(init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
 
     const client = createMockOutlookClient((path) => {
-      if (path === "/me/messages") return { post: draftPost };
-      if (path === "/me/messages/draft-1/attachments/createUploadSession") {
-        return { post: createUploadSessionPost };
-      }
-      if (path === "/me/messages/draft-1/send") return { post: sendPost };
+      if (path === "/me/messages/message-1/createForward")
+        return { post: createForwardPost };
+      if (path === "/me/messages/forward-1") return { patch: patchDraft };
+      if (path === "/me/messages/forward-1/send") return { post: sendPost };
       throw new Error(`Unexpected API path: ${path}`);
     });
 
-    await sendEmailWithHtml(
+    const result = await sendEmailWithHtml(
       client,
       {
-        to: "recipient@example.com",
-        subject: "Subject",
-        messageHtml: "<p>Hello</p>",
-        attachments: [
-          {
-            filename: "resume.pdf",
-            content: Buffer.alloc(totalSize),
-            contentType: "application/pdf",
-          },
-        ],
+        to: "Recipient Name <recipient@example.com>",
+        cc: "copied@example.com",
+        subject: "Fwd: Subject",
+        messageHtml: "<p>Passing this on</p>",
+        replyToEmail: {
+          threadId: "conversation-1",
+          forwardedMessageId: "message-1",
+        },
       },
       createTestLogger(),
     );
 
-    const statusCallIndex = fetchMock.mock.calls.findIndex(
-      ([, init]) => init?.method === "GET",
-    );
-    expect(statusCallIndex).toBeGreaterThan(-1);
-    const resumedPutCall = fetchMock.mock.calls
-      .slice(statusCallIndex + 1)
-      .find(([, init]) => init?.method === "PUT");
-    expect(getContentRangeHeader(resumedPutCall?.[1])).toBe(
-      `bytes ${chunkSize}-${chunkSize * 2 - 1}/${totalSize}`,
-    );
-    expect(sendPost).toHaveBeenCalledTimes(1);
-  });
-
-  it("falls back to local chunk progress when upload-session status is unavailable", async () => {
-    const draftPost = vi.fn(
-      async () =>
-        ({
-          id: "draft-1",
-          conversationId: "conversation-1",
-        }) as Message,
-    );
-    const createUploadSessionPost = vi.fn(async () => ({
-      uploadUrl: "https://upload.example.test/session",
-    }));
-    const sendPost = vi.fn(async () => ({}));
-    const totalSize = 3 * 1024 * 1024 + 1;
-    const chunkSize = 320 * 1024;
-    let firstChunkAttempt = 0;
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-      if (init?.method === "GET") {
-        return new Response("not supported", { status: 404 });
-      }
-
-      const contentRange = getContentRangeHeader(init);
-      if (contentRange === `bytes 0-${chunkSize - 1}/${totalSize}`) {
-        if (firstChunkAttempt === 0) {
-          firstChunkAttempt += 1;
-          throw new TypeError("fetch failed");
-        }
-
-        if (firstChunkAttempt === 1) {
-          firstChunkAttempt += 1;
-          return new Response("already received", { status: 416 });
-        }
-      }
-
-      return createUploadChunkProgressResponse(init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const client = createMockOutlookClient((path) => {
-      if (path === "/me/messages") return { post: draftPost };
-      if (path === "/me/messages/draft-1/attachments/createUploadSession") {
-        return { post: createUploadSessionPost };
-      }
-      if (path === "/me/messages/draft-1/send") return { post: sendPost };
-      throw new Error(`Unexpected API path: ${path}`);
-    });
-
-    await sendEmailWithHtml(
-      client,
-      {
-        to: "recipient@example.com",
-        subject: "Subject",
-        messageHtml: "<p>Hello</p>",
-        attachments: [
+    expect(patchDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: "Fwd: Subject",
+        body: { contentType: "html", content: "<p>Passing this on</p>" },
+        toRecipients: [
           {
-            filename: "fallback.pdf",
-            content: Buffer.alloc(totalSize),
-            contentType: "application/pdf",
+            emailAddress: {
+              address: "recipient@example.com",
+              name: "Recipient Name",
+            },
           },
         ],
-      },
-      createTestLogger(),
-    );
-
-    const statusCallIndex = fetchMock.mock.calls.findIndex(
-      ([, init]) => init?.method === "GET",
-    );
-    expect(statusCallIndex).toBeGreaterThan(-1);
-    const resumedPutCall = fetchMock.mock.calls
-      .slice(statusCallIndex + 1)
-      .find(([, init]) => init?.method === "PUT");
-    expect(getContentRangeHeader(resumedPutCall?.[1])).toBe(
-      `bytes ${chunkSize}-${chunkSize * 2 - 1}/${totalSize}`,
+        ccRecipients: [{ emailAddress: { address: "copied@example.com" } }],
+      }),
     );
     expect(sendPost).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      id: "forward-1",
+      conversationId: "conversation-1",
+    });
   });
 
-  it("surfaces unexpected upload-session status failures during 416 recovery", async () => {
+  it("does not send a forward without its original provider attachments", async () => {
+    const createForwardPost = vi.fn(async () => {
+      throw Object.assign(new Error("Item not found"), {
+        code: "ErrorItemNotFound",
+      });
+    });
     const draftPost = vi.fn(
       async () =>
-        ({
-          id: "draft-1",
-          conversationId: "conversation-1",
-        }) as Message,
+        ({ id: "draft-1", conversationId: "conversation-2" }) as Message,
     );
-    const createUploadSessionPost = vi.fn(async () => ({
-      uploadUrl: "https://upload.example.test/session",
-    }));
     const sendPost = vi.fn(async () => ({}));
-    const totalSize = 3 * 1024 * 1024 + 1;
-    const chunkSize = 320 * 1024;
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-      if (init?.method === "GET") {
-        return new Response("unavailable", { status: 503 });
-      }
-
-      const contentRange = getContentRangeHeader(init);
-      if (contentRange === `bytes 0-${chunkSize - 1}/${totalSize}`) {
-        return new Response("already received", { status: 416 });
-      }
-
-      return createUploadChunkProgressResponse(init);
-    });
-    vi.stubGlobal("fetch", fetchMock);
 
     const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1/createForward")
+        return { post: createForwardPost };
       if (path === "/me/messages") return { post: draftPost };
-      if (path === "/me/messages/draft-1/attachments/createUploadSession") {
-        return { post: createUploadSessionPost };
-      }
       if (path === "/me/messages/draft-1/send") return { post: sendPost };
       throw new Error(`Unexpected API path: ${path}`);
     });
@@ -509,27 +558,73 @@ describe("sendEmailWithHtml", () => {
         client,
         {
           to: "recipient@example.com",
-          subject: "Subject",
-          messageHtml: "<p>Hello</p>",
-          attachments: [
-            {
-              filename: "resume.pdf",
-              content: Buffer.alloc(totalSize),
-              contentType: "application/pdf",
-            },
-          ],
+          subject: "Fwd: Subject",
+          messageHtml: "<p>Passing this on</p>",
+          replyToEmail: {
+            threadId: "conversation-1",
+            forwardedMessageId: "message-1",
+          },
         },
         createTestLogger(),
       ),
-    ).rejects.toMatchObject({
-      error: expect.objectContaining({
-        message: expect.stringContaining(
-          "Failed to fetch Outlook upload session status: 503",
-        ),
-      }),
+    ).rejects.toThrow("Reload the original message before forwarding");
+
+    expect(draftPost).not.toHaveBeenCalled();
+    expect(sendPost).not.toHaveBeenCalled();
+  });
+
+  it("sends a forward as a new message when its source is unknown", async () => {
+    const draftPost = vi.fn(
+      async () =>
+        ({ id: "draft-1", conversationId: "conversation-2" }) as Message,
+    );
+    const sendPost = vi.fn(async () => ({}));
+
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages") return { post: draftPost };
+      if (path === "/me/messages/draft-1/send") return { post: sendPost };
+      throw new Error(`Unexpected API path: ${path}`);
     });
 
-    expect(sendPost).not.toHaveBeenCalled();
+    const result = await sendEmailWithHtml(
+      client,
+      {
+        to: "recipient@example.com",
+        subject: "Fwd: Subject",
+        messageHtml: "<p>Passing this on</p>",
+        replyToEmail: { threadId: "conversation-1" },
+      },
+      createTestLogger(),
+    );
+
+    expect(draftPost).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ id: "draft-1", conversationId: "conversation-2" });
+  });
+});
+
+describe("replyToEmail", () => {
+  it("returns the immutable draft ID after sending", async () => {
+    const createReplyDraft = vi.fn(async () => ({ id: "draft-1" }) as Message);
+    const updateDraft = vi.fn(async () => ({}));
+    const sendDraft = vi.fn(async () => ({}));
+    const client = createMockOutlookClient((path) => {
+      if (path === "/me/messages/message-1/createReply") {
+        return { post: createReplyDraft };
+      }
+      if (path === "/me/messages/draft-1") return { patch: updateDraft };
+      if (path === "/me/messages/draft-1/send") return { post: sendDraft };
+      throw new Error(`Unexpected API path: ${path}`);
+    });
+
+    const result = await replyToEmail(
+      client,
+      getMockMessage({ id: "message-1" }) as EmailForAction,
+      "Reply content",
+      createTestLogger(),
+    );
+
+    expect(sendDraft).toHaveBeenCalledTimes(1);
+    expect(result.id).toBe("draft-1");
   });
 });
 
@@ -585,7 +680,7 @@ describe("forwardEmail", () => {
       throw new Error(`Unexpected API path: ${path}`);
     });
 
-    await forwardEmail(
+    const result = await forwardEmail(
       client,
       {
         messageId: "message-1",
@@ -638,6 +733,7 @@ describe("forwardEmail", () => {
       }),
     );
     expect(sendDraft).toHaveBeenCalledTimes(1);
+    expect(result.id).toBe("draft-1");
   });
 });
 

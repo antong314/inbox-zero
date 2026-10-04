@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { parseAsString, useQueryState } from "nuqs";
 import { ChevronDown, Tag } from "lucide-react";
-import { sortRulesForAutomation } from "@/utils/rule/sort";
+import { sortRulesByCanonicalOrder } from "@/utils/rule/sort";
 
 export function RulesSelect() {
   const { data, isLoading, error } = useRules();
@@ -19,7 +19,7 @@ export function RulesSelect() {
     parseAsString.withDefault("all"),
   );
   const [, setPage] = useQueryState("page");
-  const sortedRules = data ? sortRulesForAutomation(data) : undefined;
+  const sortedRules = data ? sortRulesByCanonicalOrder(data) : undefined;
   const selectRule = async (nextRuleId: string) => {
     await Promise.all([setRuleId(nextRuleId), setPage("1")]);
   };
@@ -27,7 +27,7 @@ export function RulesSelect() {
   const getCurrentLabel = () => {
     if (ruleId === "all") return "All rules";
     if (ruleId === "skipped") return "No match";
-    const rule = sortedRules?.find((rule) => rule.id === ruleId);
+    const rule = data?.find((rule) => rule.id === ruleId);
     if (!rule) return "All rules";
     return rule.enabled ? rule.name : `${rule.name} (disabled)`;
   };

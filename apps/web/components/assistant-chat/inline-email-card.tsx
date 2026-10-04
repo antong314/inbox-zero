@@ -1,5 +1,6 @@
 "use client";
 
+import { OpenedConversationAttachments } from "@/components/email-list/OpenedConversationAttachments";
 import {
   Children,
   createContext,
@@ -252,8 +253,7 @@ export function InlineEmailList({ children }: { children?: ReactNode }) {
               >
                 <Button
                   variant="ghost"
-                  size="icon"
-                  className="size-7"
+                  size="iconXs"
                   loading={archiveAllState === "loading"}
                   disabled={archiveAllDone}
                   onClick={handleArchiveAll}
@@ -265,8 +265,7 @@ export function InlineEmailList({ children }: { children?: ReactNode }) {
               >
                 <Button
                   variant="ghost"
-                  size="icon"
-                  className="size-7"
+                  size="iconXs"
                   loading={markReadState === "loading"}
                   disabled={markReadDone}
                   onClick={handleMarkAllRead}
@@ -622,6 +621,7 @@ function EmailPreview({
   compact?: boolean;
   showDetails?: boolean;
 }) {
+  const { emailAccountId } = useAccount();
   const { data, isLoading, error } = useThread({ id: threadId });
 
   if (isLoading) {
@@ -635,7 +635,7 @@ function EmailPreview({
   if (error) {
     return (
       <div className="px-3 py-2 text-xs text-muted-foreground">
-        Could not load email content: {error.message}
+        Could not load email content: {error.error}
       </div>
     );
   }
@@ -651,9 +651,18 @@ function EmailPreview({
   const lastMessage = data.thread.messages[data.thread.messages.length - 1];
 
   const body = (
-    <>
+    <OpenedConversationAttachments
+      emailAccountId={emailAccountId}
+      threadId={threadId}
+      allowUncached
+    >
       {lastMessage.textHtml ? (
-        <HtmlEmail html={lastMessage.textHtml} />
+        <HtmlEmail
+          emailAccountId={emailAccountId}
+          html={lastMessage.textHtml}
+          inlineAttachments={lastMessage.inline}
+          messageId={lastMessage.id}
+        />
       ) : (
         <PlainEmail
           text={
@@ -667,7 +676,7 @@ function EmailPreview({
       {lastMessage.attachments?.length ? (
         <EmailAttachments message={lastMessage} />
       ) : null}
-    </>
+    </OpenedConversationAttachments>
   );
 
   if (compact) {

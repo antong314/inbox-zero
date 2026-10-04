@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { getEvalModels, shouldRunEvalTests } from "@/__tests__/eval/models";
+import { getEvalModels } from "@/__tests__/eval/model-catalog";
+import { shouldRunEvalTests } from "@/__tests__/eval/models";
 
 const originalEnv = { ...process.env };
 
@@ -30,7 +31,7 @@ describe("shouldRunEvalTests", () => {
 
     expect(getEvalModels()).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ model: "openai/gpt-5.6-luna" }),
+        expect.objectContaining({ model: "openai/gpt-6-luna" }),
         expect.objectContaining({ model: "openai/gpt-5.6-terra" }),
       ]),
     );

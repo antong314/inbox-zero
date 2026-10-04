@@ -9,6 +9,7 @@ import { analyzeSenderPatternBodySchema } from "@/utils/ai/choose-rule/analyze-s
 import { isValidInternalApiKey } from "@/utils/internal-api";
 import { canonicalizeEmailAddress, extractEmailAddress } from "@/utils/email";
 import { getEmailForLLM } from "@/utils/get-email-from-message";
+import { shouldLearnAiSenderPatterns } from "@/utils/rule/ai-sender-pattern-learning";
 import { saveLearnedPattern } from "@/utils/rule/learned-patterns";
 import { GroupItemSource } from "@/generated/prisma/enums";
 import { checkSenderRuleHistory } from "@/utils/rule/check-sender-rule-history";
@@ -29,7 +30,6 @@ export const POST = withError(
     let logger = request.logger;
 
     if (!isValidInternalApiKey(await headers(), logger)) {
-      logger.error("Invalid API key for sender pattern analysis", json);
       return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
     }
 
@@ -70,6 +70,11 @@ async function process({
     if (!emailAccount) {
       logger.error("Email account not found");
       return NextResponse.json({ success: false }, { status: 404 });
+    }
+
+    if (!shouldLearnAiSenderPatterns({ user: emailAccount.user })) {
+      logger.info("Skipping sender pattern detection - learning disabled");
+      return NextResponse.json({ success: true });
     }
 
     const existingCheck = await prisma.newsletter.findFirst({
@@ -223,7 +228,7 @@ async function savePatternCheck({
 }) {
   await upsertSenderRecord({
     emailAccountId,
-    newsletterEmail: from,
+    senderEmail: from,
     changes: {
       patternAnalyzed: true,
       lastAnalyzedAt: new Date(),

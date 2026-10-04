@@ -72,6 +72,7 @@ describe("public booking", () => {
       locationValue: "https://video.example.com/private-meeting",
       emailAccount: {
         name: "Host User",
+        image: "https://example.com/host-avatar.jpg",
       },
     });
 
@@ -85,6 +86,7 @@ describe("public booking", () => {
       locationType: BookingLinkLocationType.CUSTOM,
       locationValue: null,
       hostName: "Host User",
+      hostImage: "https://example.com/host-avatar.jpg",
     });
     expect(result).not.toHaveProperty("hostEmail");
     expect(result.locationValue).toBeNull();
@@ -103,6 +105,23 @@ describe("public booking", () => {
     ).resolves.toEqual([]);
 
     expect(getUnifiedCalendarAvailability).toHaveBeenCalled();
+  });
+
+  it("interprets availability windows in the host account timezone", async () => {
+    mockBookingLinkConfig({ timezone: "America/New_York" });
+    prisma.booking.findMany.mockResolvedValue([]);
+
+    const slots = await getPublicAvailability({
+      slug: "intro",
+      start: new Date("2026-05-04T00:00:00.000Z"),
+      end: new Date("2026-05-05T00:00:00.000Z"),
+      logger,
+    });
+
+    expect(slots.map((slot) => slot.startTime)).toEqual([
+      "2026-05-04T13:00:00.000Z",
+      "2026-05-04T13:30:00.000Z",
+    ]);
   });
 
   it("returns no availability when calendar availability fails", async () => {
@@ -993,6 +1012,7 @@ describe("public booking", () => {
           description: "Talk through fit.",
           locationValue: "Room 3",
           hostName: "Host User",
+          hostImage: "https://example.com/host-avatar.jpg",
         }),
       }),
     );
@@ -1044,10 +1064,10 @@ describe("public booking", () => {
       emailAccountId: "email-account-id",
       destinationCalendarId: "calendar-row-id",
       availabilitySchedule: {
-        timezone: "UTC",
         windows: [{ weekday: 1, startMinutes: 9 * 60, endMinutes: 10 * 60 }],
       },
       emailAccount: {
+        timezone: "UTC",
         calendarConnections: [
           { id: "connection-id", calendars: [{ id: "other-calendar-id" }] },
         ],
@@ -1083,6 +1103,7 @@ function mockBookingLinkConfig(
   overrides: {
     durationMinutes?: number;
     windows?: { weekday: number; startMinutes: number; endMinutes: number }[];
+    timezone?: string;
   } = {},
 ) {
   prisma.bookingLink.findFirst.mockResolvedValue({
@@ -1097,12 +1118,12 @@ function mockBookingLinkConfig(
     emailAccountId: "email-account-id",
     destinationCalendarId: "calendar-row-id",
     availabilitySchedule: {
-      timezone: "UTC",
       windows: overrides.windows ?? [
         { weekday: 1, startMinutes: 9 * 60, endMinutes: 10 * 60 },
       ],
     },
     emailAccount: {
+      timezone: overrides.timezone ?? "UTC",
       name: "Host User",
       calendarConnections: [
         { id: "connection-id", calendars: [{ id: "calendar-row-id" }] },
@@ -1153,12 +1174,11 @@ function bookingRecordBase() {
       slotIntervalMinutes: 30,
       locationType: BookingLinkLocationType.CUSTOM,
       locationValue: "Video link",
-      availabilitySchedule: {
-        timezone: "UTC",
-      },
       emailAccount: {
+        timezone: "UTC",
         email: "host@example.com",
         name: "Host User",
+        image: "https://example.com/host-avatar.jpg",
       },
     },
   };

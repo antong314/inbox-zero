@@ -3,7 +3,19 @@ import prisma from "@/utils/prisma";
 import { withError } from "@/utils/middleware";
 import { SafeError } from "@/utils/error";
 import { auth } from "@/utils/auth";
-import { isAdminForPremium, premiumEntitlementSelect } from "@/utils/premium";
+import {
+  isDecisionModelAvailable,
+  isDecisionModelEnabledForUser,
+} from "@/utils/decision-model/decision-model";
+import {
+  getRemainingUnsubscribeCredits,
+  premiumEntitlementSelect,
+} from "@/utils/premium";
+import {
+  billingAccessPremiumSelect,
+  canManageBilling,
+  organizationBillingPrincipalsSelect,
+} from "@/utils/premium/billing-access";
 
 export type UserResponse = Awaited<ReturnType<typeof getUser>> | null;
 
@@ -22,11 +34,13 @@ async function getUser({
       aiProvider: true,
       aiModel: true,
       aiApiKey: true,
+      decisionModelEnabled: true,
       webhookSecret: true,
       announcementDismissedAt: true,
       dismissedHints: true,
       premium: {
         select: {
+          ...billingAccessPremiumSelect,
           ...premiumEntitlementSelect,
           lemonSqueezyCustomerId: true,
           lemonSqueezySubscriptionId: true,
@@ -35,10 +49,10 @@ async function getUser({
           stripeSubscriptionId: true,
           stripeInvoiceEmailsEnabled: true,
           unsubscribeCredits: true,
+          unsubscribeMonth: true,
           emailAccountsAccess: true,
           lemonLicenseKey: true,
           pendingInvites: true,
-          admins: { select: { id: true } },
         },
       },
       emailAccounts: {
@@ -53,6 +67,7 @@ async function getUser({
               role: true,
               organization: {
                 select: {
+                  ...organizationBillingPrincipalsSelect,
                   name: true,
                 },
               },
@@ -66,19 +81,22 @@ async function getUser({
   if (!user) throw new SafeError("User not found");
 
   const members = user.emailAccounts.flatMap((account) =>
-    account.members.map((member) => ({
-      ...member,
+    account.members.map(({ organizationId, role, organization }) => ({
+      organizationId,
+      role,
+      organization: { name: organization.name },
       emailAccountId: account.id,
     })),
   );
 
   const { aiApiKey, webhookSecret, emailAccounts } = user;
+  const canManageBillingAccess = canManageBilling(user.id, user);
   let premium = null;
   if (user.premium) {
-    const { admins, ...premiumData } = user.premium;
+    const { admins: _admins, id: _premiumId, ...premiumData } = user.premium;
     premium = {
       ...premiumData,
-      isAdmin: isAdminForPremium(admins, user.id),
+      isAdmin: canManageBillingAccess,
     };
   }
 
@@ -87,14 +105,21 @@ async function getUser({
     createdAt: user.createdAt,
     aiProvider: user.aiProvider,
     aiModel: user.aiModel,
+    isDecisionModelAvailable: isDecisionModelAvailable(),
+    decisionModelEnabled: isDecisionModelEnabledForUser(user),
     announcementDismissedAt: user.announcementDismissedAt,
     dismissedHints: user.dismissedHints,
     premium,
+    // Resolved here so the client never compares periods against its own clock.
+    unsubscribeCreditsRemaining: getRemainingUnsubscribeCredits(
+      user.premium ?? {},
+    ),
     emailAccounts: emailAccounts.map(({ members: _members, ...account }) => ({
       ...account,
     })),
     hasAiApiKey: !!aiApiKey,
     hasWebhookSecret: !!webhookSecret,
+    canManageBilling: canManageBillingAccess,
     members,
   };
 }

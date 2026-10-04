@@ -1,7 +1,10 @@
 import { z } from "zod";
 import type { EmailAccountWithAI } from "@/utils/llms/types";
 import type { ModelType } from "@/utils/llms/model";
-import type { DraftReplyConfidence } from "@/generated/prisma/enums";
+import {
+  ActionType,
+  type DraftReplyConfidence,
+} from "@/generated/prisma/enums";
 import type { Action } from "@/generated/prisma/client";
 import {
   type RuleWithActions,
@@ -19,9 +22,23 @@ import type { EmailProvider } from "@/utils/email/types";
 import type { DraftAttribution } from "@/utils/ai/reply/draft-attribution";
 import type { DraftContextMetadata } from "@/utils/ai/reply/draft-context-metadata";
 import { isDraftReplyActionType } from "@/utils/actions/draft-reply";
+import {
+  getIntegrationToolSpec,
+  type IntegrationArgSpec,
+  isAiFilledArgValue,
+} from "@/utils/mcp/tool-specs";
 import type { SelectedAttachment } from "@/utils/attachments/source-schema";
+import { escapeHtml } from "@/utils/string";
 
 const MODULE = "choose-args";
+
+const INTEGRATION_ARGS_FIELD_PREFIX = "integrationArgs.";
+
+// These bodies are rendered as HTML by the email providers.
+const HTML_REPLY_BODY_ACTION_TYPES = new Set<ActionType>([
+  ActionType.DRAFT_EMAIL,
+  ActionType.REPLY,
+]);
 
 export type EmailAccountForDrafting = EmailAccountWithAI & {
   draftReplyConfidence: DraftReplyConfidence;
@@ -191,6 +208,29 @@ export function combineActionsWithAiArgs(
         continue;
       }
 
+      if (field.startsWith(INTEGRATION_ARGS_FIELD_PREFIX)) {
+        const argKey = field.slice(INTEGRATION_ARGS_FIELD_PREFIX.length);
+        const originalArgs = getIntegrationArgsRecord(action.integrationArgs);
+        const originalValue = originalArgs[argKey];
+        const value = typeof originalValue === "string" ? originalValue : "";
+        const argSpec = getIntegrationToolSpec(
+          action.integrationName,
+          action.integrationToolName,
+        )?.args.find((arg) => arg.key === argKey);
+
+        if (!argSpec && typeof originalValue !== "string") continue;
+
+        const resolvedVars = vars as Record<`var${number}`, string>;
+        updatedAction.integrationArgs = {
+          ...getIntegrationArgsRecord(updatedAction.integrationArgs),
+          // AI-filled args take the generated value wholesale; templates stitch
+          [argKey]: isAiFilledArgValue(argSpec, value)
+            ? (resolvedVars.var1 ?? "").trim()
+            : mergeTemplateWithVars(value, resolvedVars),
+        } as Action["integrationArgs"];
+        continue;
+      }
+
       // Only process fields that we know can contain template strings
       if (
         field === "label" ||
@@ -203,9 +243,12 @@ export function combineActionsWithAiArgs(
       ) {
         const originalValue = action[field];
         if (typeof originalValue === "string") {
+          const resolvedVars = vars as Record<`var${number}`, string>;
           (updatedAction[field] as string) = mergeTemplateWithVars(
             originalValue,
-            vars as Record<`var${number}`, string>,
+            field === "content" && HTML_REPLY_BODY_ACTION_TYPES.has(action.type)
+              ? escapeTemplateVars(resolvedVars)
+              : resolvedVars,
           );
         }
       }
@@ -312,7 +355,11 @@ export function getParameterFieldsForAction(
   action: Pick<
     Action,
     "label" | "subject" | "content" | "to" | "cc" | "bcc" | "url"
-  >,
+  > & {
+    integrationName?: Action["integrationName"];
+    integrationToolName?: Action["integrationToolName"];
+    integrationArgs?: Action["integrationArgs"];
+  },
 ) {
   const fields: Record<string, z.ZodObject<Record<string, z.ZodString>>> = {};
   const fieldNames = [
@@ -328,27 +375,62 @@ export function getParameterFieldsForAction(
   for (const field of fieldNames) {
     const value = action[field];
     if (typeof value === "string") {
-      const { aiPrompts } = parseTemplate(value);
-      if (aiPrompts.length > 0) {
-        const schemaFields: Record<string, z.ZodString> = {};
-        aiPrompts.forEach((_prompt, index) => {
-          schemaFields[`var${index + 1}`] = z.string();
-        });
+      const templateField = buildTemplateField(value);
+      if (templateField) fields[field] = templateField;
+    }
+  }
 
-        // Transform original template to use var1, var2, etc
-        let template = value;
-        aiPrompts.forEach((prompt, index) => {
-          template = template.replace(
-            `{{${prompt}}}`,
-            `{{var${index + 1}: ${prompt}}}`,
-          );
-        });
+  const integrationArgs = getIntegrationArgsRecord(action.integrationArgs);
+  const spec = getIntegrationToolSpec(
+    action.integrationName,
+    action.integrationToolName,
+  );
 
-        const variableList = aiPrompts
-          .map((prompt, index) => `- var${index + 1}: ${prompt}`)
-          .join("\n");
+  // An empty arg the spec marks as AI-filled works like an empty draft-reply
+  // content: the AI writes the whole value. Templates keep their own path.
+  for (const arg of spec?.args ?? []) {
+    const argValue = integrationArgs[arg.key];
+    const value = typeof argValue === "string" ? argValue : "";
 
-        const description = `Fill in the variable(s) for this template. Return ONLY the value for each variable, not the surrounding template text.
+    const field = isAiFilledArgValue(arg, value)
+      ? buildWholeValueField(arg)
+      : buildTemplateField(value);
+
+    if (field) fields[`${INTEGRATION_ARGS_FIELD_PREFIX}${arg.key}`] = field;
+  }
+
+  return fields;
+}
+
+function buildWholeValueField(arg: IntegrationArgSpec) {
+  return z.object({ var1: z.string() }).describe(`${arg.aiPrompt}
+
+Return the full value in var1.`);
+}
+
+function buildTemplateField(value: string) {
+  const { aiPrompts } = parseTemplate(value);
+  if (aiPrompts.length === 0) return null;
+
+  const schemaFields: Record<string, z.ZodString> = {};
+  aiPrompts.forEach((_prompt, index) => {
+    schemaFields[`var${index + 1}`] = z.string();
+  });
+
+  // Transform original template to use var1, var2, etc
+  let template = value;
+  aiPrompts.forEach((prompt, index) => {
+    template = template.replace(
+      `{{${prompt}}}`,
+      `{{var${index + 1}: ${prompt}}}`,
+    );
+  });
+
+  const variableList = aiPrompts
+    .map((prompt, index) => `- var${index + 1}: ${prompt}`)
+    .join("\n");
+
+  const description = `Fill in the variable(s) for this template. Return ONLY the value for each variable, not the surrounding template text.
 
 Variables to fill:
 ${variableList}
@@ -356,12 +438,20 @@ ${variableList}
 Full template for context:
 ${template}`;
 
-        fields[field] = z.object(schemaFields).describe(description);
-      }
-    }
-  }
+  return z.object(schemaFields).describe(description);
+}
 
-  return fields;
+function getIntegrationArgsRecord(
+  integrationArgs: Action["integrationArgs"] | undefined,
+): Record<string, unknown> {
+  if (
+    integrationArgs &&
+    typeof integrationArgs === "object" &&
+    !Array.isArray(integrationArgs)
+  ) {
+    return integrationArgs as Record<string, unknown>;
+  }
+  return {};
 }
 
 /**
@@ -427,4 +517,11 @@ export function mergeTemplateWithVars(
   }
 
   return result;
+}
+
+// AI-filled values are untrusted; the user's own template text is kept as written.
+function escapeTemplateVars(vars: Record<`var${number}`, string>) {
+  return Object.fromEntries(
+    Object.entries(vars).map(([key, value]) => [key, escapeHtml(value)]),
+  ) as Record<`var${number}`, string>;
 }
